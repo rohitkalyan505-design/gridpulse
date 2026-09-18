@@ -1,0 +1,18 @@
+# ==============================================================================
+# GridPulse — Scientific Engine Foundation Dependencies
+# ==============================================================================
+# Phase 1: Environment baseline specification.
+# Note: Algorithms and domain implementations are deferred to Phase 2.
+# ==============================================================================
+
+# Core numerical computing & array operations
+numpy>=2.0.0
+
+# Telemetry data manipulation, time-series, and interval data structures
+pandas>=2.2.0
+
+# Scientific computing, signal processing, and physical modeling solvers
+scipy>=1.14.0
+
+# Statistical learning, clustering, and anomaly detection baselines
+scikit-learn>=1.5.0
