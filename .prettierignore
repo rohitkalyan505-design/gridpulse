@@ -1,0 +1,19 @@
+# Package and build artifacts
+node_modules/
+.next/
+dist/
+build/
+coverage/
+
+# Python environment & cache
+.venv/
+venv/
+__pycache__/
+
+# IDE and agent worktrees
+.kilo/
+.vscode/
+.idea/
+
+# Package locks & build cache
+*.tsbuildinfo
