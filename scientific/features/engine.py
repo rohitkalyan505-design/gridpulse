@@ -14,17 +14,23 @@ from datetime import datetime
 from typing import Any, Dict, List, Optional, Tuple
 
 from scientific.contracts.asset import TransformerAssetSpec
-from scientific.contracts.enums import EvidenceClassification
+from scientific.contracts.enums import EvidenceClassification, IssueSeverity
 from scientific.contracts.issues import ProcessingIssue
 from scientific.contracts.measurement import Measurement
-from scientific.contracts.results import ElectricalFeaturesResult
+from scientific.contracts.results import ElectricalFeaturesResult, TransformerLoadingResult
 from scientific.features.calculations import (
     calculate_apparent_power,
     calculate_power_factor,
     calculate_three_phase_average_current,
     calculate_three_phase_average_voltage,
 )
+from scientific.features.loading import (
+    DEFAULT_NOMINAL_INTERVAL_SECONDS,
+    calculate_batch_loading,
+    calculate_record_loading,
+)
 from scientific.validation.contracts import ValidatedTelemetryBatch, ValidatedTelemetryRecord
+
 
 
 class ElectricalCalculationEngine:
@@ -154,3 +160,69 @@ class ElectricalCalculationEngine:
             all_issues.extend(rec_issues)
 
         return all_features, all_issues
+
+    def compute_record_loading(
+        self,
+        features: ElectricalFeaturesResult,
+        asset_spec: Optional[TransformerAssetSpec] = None,
+    ) -> Tuple[Optional[TransformerLoadingResult], List[ProcessingIssue]]:
+        """
+        Computes deterministic overall transformer loading for a single record feature result.
+        """
+        eff_spec = asset_spec or self.asset_spec
+        if eff_spec is None:
+            issue = ProcessingIssue(
+                stage="loading_analysis",
+                severity=IssueSeverity.CRITICAL,
+                code="ERR_INSUFFICIENT_TELEMETRY",
+                message="TransformerAssetSpec is required for loading calculation.",
+                field_name="asset_spec",
+            )
+            return None, [issue]
+
+        s_meas = features.apparent_power_kva
+        if s_meas is None:
+            issue = ProcessingIssue(
+                stage="loading_analysis",
+                severity=IssueSeverity.WARNING,
+                code="ERR_INSUFFICIENT_TELEMETRY",
+                message="Apparent power measurement is missing in ElectricalFeaturesResult.",
+                field_name="apparent_power_kva",
+            )
+            return None, [issue]
+
+        return calculate_record_loading(
+            apparent_power=s_meas,
+            asset_spec=eff_spec,
+            timestamp=s_meas.timestamp,
+        )
+
+    def compute_batch_loading(
+        self,
+        features_list: List[ElectricalFeaturesResult],
+        asset_spec: Optional[TransformerAssetSpec] = None,
+        nominal_interval_seconds: float = DEFAULT_NOMINAL_INTERVAL_SECONDS,
+        max_gap_seconds: Optional[float] = None,
+    ) -> Tuple[TransformerLoadingResult, List[ProcessingIssue]]:
+        """
+        Computes deterministic batch-level transformer loading analytics including
+        forward-interval time-weighted average loading, peak loading, and overload cycles.
+        """
+        eff_spec = asset_spec or self.asset_spec
+        if eff_spec is None:
+            issue = ProcessingIssue(
+                stage="loading_analysis",
+                severity=IssueSeverity.CRITICAL,
+                code="ERR_INSUFFICIENT_TELEMETRY",
+                message="TransformerAssetSpec is required for loading calculation.",
+                field_name="asset_spec",
+            )
+            return TransformerLoadingResult(is_computed=False), [issue]
+
+        return calculate_batch_loading(
+            features_list=features_list,
+            asset_spec=eff_spec,
+            nominal_interval_seconds=nominal_interval_seconds,
+            max_gap_seconds=max_gap_seconds,
+        )
+

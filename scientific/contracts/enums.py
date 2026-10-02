@@ -79,3 +79,22 @@ class PhaseIdentification(str, Enum):
     PHASE_C = "C"
     NEUTRAL = "N"
     THREE_PHASE = "3P"
+
+
+class LoadingState(str, Enum):
+    """
+    Deterministic transformer loading screening bands.
+    The 0.30 and 0.80 boundaries are GridPulse configurable screening conventions.
+    """
+    LIGHT = "LIGHT"                              # 0.00 <= L < 0.30
+    NORMAL = "NORMAL"                            # 0.30 <= L <= 0.80
+    ELEVATED = "ELEVATED"                        # 0.80 < L <= continuous_threshold
+    CONTINUOUS_OVERLOAD = "CONTINUOUS_OVERLOAD"  # continuous_threshold < L <= emergency_threshold
+    EMERGENCY_OVERLOAD = "EMERGENCY_OVERLOAD"    # L > emergency_threshold
+
+
+class OverloadSeverity(str, Enum):
+    """Classification of an individual overload cycle."""
+    CONTINUOUS_OVERLOAD = "CONTINUOUS_OVERLOAD"
+    EMERGENCY_OVERLOAD = "EMERGENCY_OVERLOAD"
+

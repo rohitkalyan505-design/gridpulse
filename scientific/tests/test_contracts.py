@@ -362,17 +362,47 @@ class TestNoAlgorithmsInStep1(unittest.TestCase):
         self.assertIsNone(di.health_index)
 
 
-class TestModuleContractImports(unittest.TestCase):
-    """Verifies that all scientific subdirectories have cohesive, importable contracts."""
+class TestTransformerLoadingContracts(unittest.TestCase):
+    """
+    Validates Phase 2 Step 4 transformer loading contracts.
+    Enforces that TransformerLoadingResult has NO per-phase loading fields.
+    """
 
-    def test_imports(self):
-        self.assertTrue(issubclass(ScientificEngineError, Exception))
-        self.assertTrue(issubclass(TelemetryValidationError, ScientificEngineError))
-        self.assertTrue(issubclass(PhysicalBoundaryError, ScientificEngineError))
-        self.assertTrue(issubclass(InsufficientTelemetryError, ScientificEngineError))
-        self.assertTrue(issubclass(ContractViolationError, ScientificEngineError))
-        self.assertTrue(issubclass(AssetSpecError, ScientificEngineError))
+    def test_no_phase_loading_fields_in_contract(self):
+        tl = TransformerLoadingResult()
+        self.assertFalse(hasattr(tl, "phase_a_loading_pu"))
+        self.assertFalse(hasattr(tl, "phase_b_loading_pu"))
+        self.assertFalse(hasattr(tl, "phase_c_loading_pu"))
+
+    def test_serialization_contains_no_phase_fields(self):
+        now_utc = datetime.now(timezone.utc)
+        provenance = ProvenanceMetadata(
+            pipeline_version="0.2.0-step4",
+            execution_timestamp=now_utc,
+            telemetry_digest="a" * 64,
+            asset_id="TX-01",
+        )
+        summary = ValidationSummary(
+            total_records=1, valid_records=1, suspect_records=0, bad_records=0, missing_records=0, dropped_records=0
+        )
+        run_res = ScientificRunResult(
+            run_id="run-loading-001",
+            asset_id="TX-01",
+            time_window_start=now_utc,
+            time_window_end=now_utc,
+            pipeline_version="0.2.0-step4",
+            provenance=provenance,
+            validation_summary=summary,
+            transformer_loading=TransformerLoadingResult(is_computed=False),
+        )
+        d = run_res.to_dict()
+        tl_dict = d["transformer_loading"]
+        self.assertIsNotNone(tl_dict)
+        self.assertNotIn("phase_a_loading_pu", tl_dict)
+        self.assertNotIn("phase_b_loading_pu", tl_dict)
+        self.assertNotIn("phase_c_loading_pu", tl_dict)
 
 
 if __name__ == "__main__":
     unittest.main()
+

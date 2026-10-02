@@ -9,9 +9,12 @@ Defines:
 """
 
 from dataclasses import dataclass, field
-from typing import Optional
+from datetime import datetime, timezone
+import math
+from typing import Optional, Tuple
 
-from scientific.contracts.enums import CoolingType, InsulationClass, WindingMaterial
+from scientific.contracts.enums import CoolingType, InsulationClass, IssueSeverity, WindingMaterial
+from scientific.contracts.issues import ProcessingIssue
 
 
 @dataclass(frozen=True)
@@ -30,12 +33,86 @@ class OperationalLimits:
     max_current_unbalance_percent: float = 10.0
 
     def __post_init__(self) -> None:
-        if self.max_continuous_loading_pu <= 0:
-            raise ValueError("max_continuous_loading_pu must be strictly positive.")
-        if self.emergency_loading_pu < self.max_continuous_loading_pu:
-            raise ValueError("emergency_loading_pu cannot be lower than max_continuous_loading_pu.")
         if self.max_top_oil_temp_c >= self.max_hot_spot_temp_c:
             raise ValueError("max_top_oil_temp_c must be strictly less than max_hot_spot_temp_c.")
+
+
+def validate_loading_thresholds(
+    continuous_threshold: float,
+    emergency_threshold: float,
+    asset_id: Optional[str] = None,
+) -> Tuple[bool, Optional[ProcessingIssue]]:
+    """
+    Validates the configuration invariants for transformer loading thresholds:
+    1. 0 < continuous_threshold < emergency_threshold
+    2. 0.80 <= continuous_threshold < emergency_threshold
+    3. Both thresholds must be finite positive numbers (not NaN, not Inf).
+
+    Returns:
+        (is_valid, optional_issue)
+    """
+    if not isinstance(continuous_threshold, (int, float)) or not isinstance(emergency_threshold, (int, float)):
+        return False, ProcessingIssue(
+            stage="loading_analysis",
+            severity=IssueSeverity.CRITICAL,
+            code="ERR_INVALID_LOADING_THRESHOLD_CONFIGURATION",
+            message=(
+                f"Loading thresholds must be numeric, got continuous={continuous_threshold}, "
+                f"emergency={emergency_threshold}."
+            ),
+            field_name="operational_limits",
+        )
+
+    if not math.isfinite(continuous_threshold) or not math.isfinite(emergency_threshold):
+        return False, ProcessingIssue(
+            stage="loading_analysis",
+            severity=IssueSeverity.CRITICAL,
+            code="ERR_INVALID_LOADING_THRESHOLD_CONFIGURATION",
+            message=(
+                f"Loading thresholds must be finite numbers: "
+                f"continuous_threshold={continuous_threshold}, emergency_threshold={emergency_threshold}."
+            ),
+            field_name="operational_limits",
+        )
+
+    if continuous_threshold <= 0 or emergency_threshold <= 0:
+        return False, ProcessingIssue(
+            stage="loading_analysis",
+            severity=IssueSeverity.CRITICAL,
+            code="ERR_INVALID_LOADING_THRESHOLD_CONFIGURATION",
+            message=(
+                f"Loading thresholds must be strictly positive: "
+                f"continuous_threshold={continuous_threshold}, emergency_threshold={emergency_threshold}."
+            ),
+            field_name="operational_limits",
+        )
+
+    if continuous_threshold < 0.80:
+        return False, ProcessingIssue(
+            stage="loading_analysis",
+            severity=IssueSeverity.CRITICAL,
+            code="ERR_INVALID_LOADING_THRESHOLD_CONFIGURATION",
+            message=(
+                f"Continuous threshold {continuous_threshold} violates screening-band lower bound (must be >= 0.80 pu) "
+                f"to ensure deterministic interval [0.80, continuous_threshold]."
+            ),
+            field_name="operational_limits.max_continuous_loading_pu",
+        )
+
+    if emergency_threshold <= continuous_threshold:
+        return False, ProcessingIssue(
+            stage="loading_analysis",
+            severity=IssueSeverity.CRITICAL,
+            code="ERR_INVALID_LOADING_THRESHOLD_CONFIGURATION",
+            message=(
+                f"Emergency threshold must be strictly greater than continuous threshold: "
+                f"continuous_threshold={continuous_threshold}, emergency_threshold={emergency_threshold}."
+            ),
+            field_name="operational_limits.emergency_loading_pu",
+        )
+
+    return True, None
+
 
 
 @dataclass(frozen=True)

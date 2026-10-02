@@ -25,6 +25,7 @@ from datetime import datetime
 from typing import Any, Dict, List, Optional
 import uuid
 
+from scientific.contracts.enums import LoadingState, OverloadSeverity
 from scientific.contracts.issues import ProcessingIssue
 from scientific.contracts.measurement import Measurement
 from scientific.contracts.provenance import ProvenanceMetadata
@@ -74,19 +75,50 @@ class ElectricalFeaturesResult:
 
 
 @dataclass(frozen=True)
+class OverloadCycle:
+    """Deterministic representation of a contiguous transformer overload episode."""
+    cycle_id: str
+    start_time: datetime
+    end_time: datetime
+    duration_seconds: float
+    peak_loading_ratio_pu: float
+    peak_apparent_power_kva: float
+    severity: OverloadSeverity
+    continuity_break_detected: bool = False
+
+    def to_dict(self) -> Dict[str, Any]:
+        return {
+            "cycle_id": self.cycle_id,
+            "start_time": self.start_time.isoformat(),
+            "end_time": self.end_time.isoformat(),
+            "duration_seconds": self.duration_seconds,
+            "peak_loading_ratio_pu": self.peak_loading_ratio_pu,
+            "peak_apparent_power_kva": self.peak_apparent_power_kva,
+            "severity": self.severity.value,
+            "continuity_break_detected": self.continuity_break_detected,
+        }
+
+
+@dataclass(frozen=True)
 class TransformerLoadingResult:
     """
-    Contract defining future transformer loading results.
-    Loading algorithms and capacity calculations are deferred to later steps.
+    Contract defining overall transformer loading and overload analytics.
+    Phase 2 Step 4: Overall transformer loading only.
+    Per-phase loading fields are strictly excluded and deferred to Step 6.
     """
     is_computed: bool = False
     loading_ratio_pu: Optional[Measurement[float]] = None
-    peak_loading_ratio_pu: Optional[Measurement[float]] = None
+    loading_percent: Optional[Measurement[float]] = None
+    loading_state: Optional[LoadingState] = None
     total_apparent_power_kva: Optional[Measurement[float]] = None
-    phase_a_loading_pu: Optional[Measurement[float]] = None
-    phase_b_loading_pu: Optional[Measurement[float]] = None
-    phase_c_loading_pu: Optional[Measurement[float]] = None
+    time_weighted_average_loading_pu: Optional[Measurement[float]] = None
+    peak_loading_ratio_pu: Optional[Measurement[float]] = None
+    peak_loading_timestamp: Optional[datetime] = None
     is_overloaded: bool = False
+    is_emergency: bool = False
+    total_overload_duration_seconds: float = 0.0
+    overload_cycles: List[OverloadCycle] = field(default_factory=list)
+    calculation_provenance: Dict[str, Any] = field(default_factory=dict)
 
 
 @dataclass(frozen=True)
@@ -275,12 +307,17 @@ class ScientificRunResult:
                 {
                     "is_computed": self.transformer_loading.is_computed,
                     "loading_ratio_pu": serialize_measurement(self.transformer_loading.loading_ratio_pu),
-                    "peak_loading_ratio_pu": serialize_measurement(self.transformer_loading.peak_loading_ratio_pu),
+                    "loading_percent": serialize_measurement(self.transformer_loading.loading_percent),
+                    "loading_state": self.transformer_loading.loading_state.value if self.transformer_loading.loading_state else None,
                     "total_apparent_power_kva": serialize_measurement(self.transformer_loading.total_apparent_power_kva),
-                    "phase_a_loading_pu": serialize_measurement(self.transformer_loading.phase_a_loading_pu),
-                    "phase_b_loading_pu": serialize_measurement(self.transformer_loading.phase_b_loading_pu),
-                    "phase_c_loading_pu": serialize_measurement(self.transformer_loading.phase_c_loading_pu),
+                    "time_weighted_average_loading_pu": serialize_measurement(self.transformer_loading.time_weighted_average_loading_pu),
+                    "peak_loading_ratio_pu": serialize_measurement(self.transformer_loading.peak_loading_ratio_pu),
+                    "peak_loading_timestamp": self.transformer_loading.peak_loading_timestamp.isoformat() if self.transformer_loading.peak_loading_timestamp else None,
                     "is_overloaded": self.transformer_loading.is_overloaded,
+                    "is_emergency": self.transformer_loading.is_emergency,
+                    "total_overload_duration_seconds": self.transformer_loading.total_overload_duration_seconds,
+                    "overload_cycles": [c.to_dict() for c in self.transformer_loading.overload_cycles],
+                    "calculation_provenance": self.transformer_loading.calculation_provenance,
                 }
                 if self.transformer_loading
                 else None
