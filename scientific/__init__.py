@@ -31,6 +31,7 @@ from scientific.contracts import (
     ValidationSummary,
     ElectricalFeaturesResult,
     TransformerLoadingResult,
+    ThermalIntervalResult,
     ThermalStateResult,
     PhaseImbalanceResult,
     AnomalyAssessmentResult,
@@ -42,6 +43,11 @@ from scientific.contracts import (
     InsufficientTelemetryError,
     ContractViolationError,
     AssetSpecError,
+    ThermalModelError,
+    ThermalModelStandard,
+    AgingStandardPreference,
+    InsulationSystemType,
+    ParameterSourceClass,
 )
 
 __all__ = [
@@ -49,6 +55,10 @@ __all__ = [
     # Enums
     "EvidenceClassification",
     "MeasurementQuality",
+    "ThermalModelStandard",
+    "AgingStandardPreference",
+    "InsulationSystemType",
+    "ParameterSourceClass",
     # Measurement & Units
     "Measurement",
     "UnitMetadata",
@@ -68,10 +78,12 @@ __all__ = [
     "InsufficientTelemetryError",
     "ContractViolationError",
     "AssetSpecError",
+    "ThermalModelError",
     # Results
     "ValidationSummary",
     "ElectricalFeaturesResult",
     "TransformerLoadingResult",
+    "ThermalIntervalResult",
     "ThermalStateResult",
     "PhaseImbalanceResult",
     "AnomalyAssessmentResult",

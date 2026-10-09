@@ -98,3 +98,41 @@ class OverloadSeverity(str, Enum):
     CONTINUOUS_OVERLOAD = "CONTINUOUS_OVERLOAD"
     EMERGENCY_OVERLOAD = "EMERGENCY_OVERLOAD"
 
+
+class ThermalModelStandard(str, Enum):
+    """
+    Standard formulation governing transformer thermal differential equations.
+    Phase 2 Step 5: Explicitly selected with no default fallback.
+    """
+    IEEE = "IEEE"
+    IEC = "IEC"
+
+
+class AgingStandardPreference(str, Enum):
+    """
+    Explicit standard selection for insulation loss-of-life integration.
+    Phase 2 Step 5: Mandatory configuration with no default fallback.
+    """
+    IEEE = "IEEE"
+    IEC = "IEC"
+
+
+class InsulationSystemType(str, Enum):
+    """
+    Transformer paper insulation thermal upgrade classification.
+    Governs reference hot-spot temperatures and degradation kinetics.
+    """
+    THERMALLY_UPGRADED_PAPER = "THERMALLY_UPGRADED_PAPER"
+    NON_THERMALLY_UPGRADED_PAPER = "NON_THERMALLY_UPGRADED_PAPER"
+
+
+class ParameterSourceClass(str, Enum):
+    """
+    Scientific provenance classification for asset thermal model parameters.
+    Only approved verified sources are admitted for production high-consequence calculations.
+    """
+    FACTORY_TEST = "FACTORY_TEST"
+    MANUFACTURER_DOCUMENT = "MANUFACTURER_DOCUMENT"
+    ASSET_VERIFIED = "ASSET_VERIFIED"
+    ENGINEERING_ASSUMPTION = "ENGINEERING_ASSUMPTION"
+    UNKNOWN = "UNKNOWN"

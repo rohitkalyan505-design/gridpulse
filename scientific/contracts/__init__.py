@@ -13,6 +13,10 @@ from scientific.contracts.enums import (
     InsulationClass,
     WindingMaterial,
     PhaseIdentification,
+    ThermalModelStandard,
+    AgingStandardPreference,
+    InsulationSystemType,
+    ParameterSourceClass,
 )
 from scientific.contracts.standards import StandardReference
 from scientific.contracts.measurement import (
@@ -37,11 +41,13 @@ from scientific.contracts.issues import (
     InsufficientTelemetryError,
     ContractViolationError,
     AssetSpecError,
+    ThermalModelError,
 )
 from scientific.contracts.results import (
     ValidationSummary,
     ElectricalFeaturesResult,
     TransformerLoadingResult,
+    ThermalIntervalResult,
     ThermalStateResult,
     PhaseImbalanceResult,
     AnomalyAssessmentResult,
@@ -58,6 +64,10 @@ __all__ = [
     "InsulationClass",
     "WindingMaterial",
     "PhaseIdentification",
+    "ThermalModelStandard",
+    "AgingStandardPreference",
+    "InsulationSystemType",
+    "ParameterSourceClass",
     # Standards
     "StandardReference",
     # Measurement & Units
@@ -79,10 +89,12 @@ __all__ = [
     "InsufficientTelemetryError",
     "ContractViolationError",
     "AssetSpecError",
+    "ThermalModelError",
     # Results
     "ValidationSummary",
     "ElectricalFeaturesResult",
     "TransformerLoadingResult",
+    "ThermalIntervalResult",
     "ThermalStateResult",
     "PhaseImbalanceResult",
     "AnomalyAssessmentResult",

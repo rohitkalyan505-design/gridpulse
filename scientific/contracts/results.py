@@ -22,10 +22,16 @@ or decision heuristics.
 
 from dataclasses import dataclass, field
 from datetime import datetime
-from typing import Any, Dict, List, Optional
+from typing import Any, Dict, List, Optional, Union
 import uuid
 
-from scientific.contracts.enums import LoadingState, OverloadSeverity
+from scientific.contracts.enums import (
+    AgingStandardPreference,
+    InsulationSystemType,
+    LoadingState,
+    OverloadSeverity,
+    ThermalModelStandard,
+)
 from scientific.contracts.issues import ProcessingIssue
 from scientific.contracts.measurement import Measurement
 from scientific.contracts.provenance import ProvenanceMetadata
@@ -122,19 +128,66 @@ class TransformerLoadingResult:
 
 
 @dataclass(frozen=True)
+class ThermalIntervalResult:
+    """
+    Interval-specific thermal and loss-of-life contribution.
+    Phase 2 Step 5 forward interval [t_k, t_{k+1}).
+    """
+    timestamp_start: datetime
+    timestamp_end: datetime
+    duration_hours: float
+    equivalent_aging_hours: Optional[Measurement[float]] = None
+    is_continuity_break: bool = False
+    is_quarantined: bool = False
+
+
+@dataclass(frozen=True)
 class ThermalStateResult:
     """
-    Contract defining future thermal analysis results.
-    Thermal ODE differential equations and loss of life calculations
-    are deferred to later steps.
+    Contract defining thermal analysis results and insulation degradation.
+    Phase 2 Step 5: Comprehensive thermal state and loss of life integration.
     """
     is_computed: bool = False
+
+    # Absolute Temperature States (°C)
     top_oil_temp_c: Optional[Measurement[float]] = None
     hot_spot_temp_c: Optional[Measurement[float]] = None
     ambient_temp_c: Optional[Measurement[float]] = None
-    aging_acceleration_factor: Optional[Measurement[float]] = None
-    equivalent_loss_of_life_hours: Optional[Measurement[float]] = None
-    thermal_model_standard: Optional[str] = None
+
+    # Temperature Rises (K)
+    top_oil_rise_k: Optional[Measurement[float]] = None
+    hot_spot_rise_k: Optional[Measurement[float]] = None
+
+    # Independent Degradation Rates (Dimensionless)
+    aging_acceleration_factor_faa: Optional[Measurement[float]] = None
+    relative_ageing_rate_v: Optional[Measurement[float]] = None
+    aging_acceleration_factor: Optional[Measurement[float]] = None  # Backward compatibility alias
+
+    # Forward Interval Contribution
+    forward_interval_result: Optional[ThermalIntervalResult] = None
+
+    # Cumulative Batch Metrics
+    equivalent_loss_of_life_hours: Optional[Measurement[float]] = None  # Cumulative equivalent aging hours
+    cumulative_aging_hours: Optional[Measurement[float]] = None        # Explicit cumulative alias
+    loss_of_life_percent: Optional[Measurement[float]] = None
+    reference_life_hours: Optional[float] = None
+    is_integration_complete: bool = True
+
+    # Metadata & Provenance
+    timestamp: Optional[datetime] = None
+    asset_id: Optional[str] = None
+    thermal_model_standard: Optional[Union[ThermalModelStandard, str]] = None
+    aging_standard: Optional[AgingStandardPreference] = None
+    insulation_system: Optional[InsulationSystemType] = None
+    faa_reference_temperature_c: Optional[float] = None
+    v_reference_temperature_c: Optional[float] = None
+
+    # Operational & Diagnostic Flags
+    is_continuity_break: bool = False
+    is_thermal_quarantined: bool = False
+    issues: List[ProcessingIssue] = field(default_factory=list)
+    calculation_provenance: Dict[str, Any] = field(default_factory=dict)
+
 
 
 @dataclass(frozen=True)
@@ -328,9 +381,24 @@ class ScientificRunResult:
                     "top_oil_temp_c": serialize_measurement(self.thermal_state.top_oil_temp_c),
                     "hot_spot_temp_c": serialize_measurement(self.thermal_state.hot_spot_temp_c),
                     "ambient_temp_c": serialize_measurement(self.thermal_state.ambient_temp_c),
+                    "top_oil_rise_k": serialize_measurement(self.thermal_state.top_oil_rise_k),
+                    "hot_spot_rise_k": serialize_measurement(self.thermal_state.hot_spot_rise_k),
+                    "aging_acceleration_factor_faa": serialize_measurement(self.thermal_state.aging_acceleration_factor_faa),
+                    "relative_ageing_rate_v": serialize_measurement(self.thermal_state.relative_ageing_rate_v),
                     "aging_acceleration_factor": serialize_measurement(self.thermal_state.aging_acceleration_factor),
                     "equivalent_loss_of_life_hours": serialize_measurement(self.thermal_state.equivalent_loss_of_life_hours),
-                    "thermal_model_standard": self.thermal_state.thermal_model_standard,
+                    "loss_of_life_percent": serialize_measurement(self.thermal_state.loss_of_life_percent),
+                    "reference_life_hours": self.thermal_state.reference_life_hours,
+                    "is_continuity_break": self.thermal_state.is_continuity_break,
+                    "is_thermal_quarantined": self.thermal_state.is_thermal_quarantined,
+                    "is_integration_complete": self.thermal_state.is_integration_complete,
+                    "thermal_model_standard": (
+                        self.thermal_state.thermal_model_standard.value
+                        if hasattr(self.thermal_state.thermal_model_standard, "value")
+                        else self.thermal_state.thermal_model_standard
+                    ),
+                    "aging_standard": self.thermal_state.aging_standard.value if self.thermal_state.aging_standard else None,
+                    "calculation_provenance": self.thermal_state.calculation_provenance,
                 }
                 if self.thermal_state
                 else None

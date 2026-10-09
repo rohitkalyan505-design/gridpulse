@@ -403,6 +403,105 @@ class TestTransformerLoadingContracts(unittest.TestCase):
         self.assertNotIn("phase_c_loading_pu", tl_dict)
 
 
+class TestPhase2Step5ThermalContracts(unittest.TestCase):
+    """Validates Phase 2 Step 5 thermal contracts, enums, and serialization."""
+
+    def test_thermal_enums_members(self):
+        from scientific.contracts.enums import (
+            ThermalModelStandard,
+            AgingStandardPreference,
+            InsulationSystemType,
+            ParameterSourceClass,
+        )
+        self.assertEqual({s.value for s in ThermalModelStandard}, {"IEEE", "IEC"})
+        self.assertEqual({s.value for s in AgingStandardPreference}, {"IEEE", "IEC"})
+        self.assertEqual(
+            {s.value for s in InsulationSystemType},
+            {"THERMALLY_UPGRADED_PAPER", "NON_THERMALLY_UPGRADED_PAPER"},
+        )
+        self.assertEqual(
+            {s.value for s in ParameterSourceClass},
+            {
+                "FACTORY_TEST",
+                "MANUFACTURER_DOCUMENT",
+                "ASSET_VERIFIED",
+                "ENGINEERING_ASSUMPTION",
+                "UNKNOWN",
+            },
+        )
+
+    def test_provenanced_parameter_approval(self):
+        from scientific.thermal.contracts import ProvenancedParameter
+        from scientific.contracts.enums import ParameterSourceClass
+
+        param_approved = ProvenancedParameter(
+            parameter_name="rated_top_oil_rise_k",
+            value=55.0,
+            unit="K",
+            source_class=ParameterSourceClass.FACTORY_TEST,
+            reference_document="FAT-001.pdf",
+            is_verified=True,
+            applicable_asset_id="TX-01",
+        )
+        self.assertTrue(param_approved.is_approved_for_high_consequence())
+
+        param_assumption = ProvenancedParameter(
+            parameter_name="rated_top_oil_rise_k",
+            value=55.0,
+            unit="K",
+            source_class=ParameterSourceClass.ENGINEERING_ASSUMPTION,
+            reference_document="Typical",
+            is_verified=True,
+            applicable_asset_id="TX-01",
+        )
+        self.assertFalse(param_assumption.is_approved_for_high_consequence())
+
+        param_unverified = ProvenancedParameter(
+            parameter_name="rated_top_oil_rise_k",
+            value=55.0,
+            unit="K",
+            source_class=ParameterSourceClass.FACTORY_TEST,
+            reference_document="FAT-001.pdf",
+            is_verified=False,
+            applicable_asset_id="TX-01",
+        )
+        self.assertFalse(param_unverified.is_approved_for_high_consequence())
+
+    def test_thermal_state_result_serialization(self):
+        from scientific.contracts.results import ThermalIntervalResult, ThermalStateResult, ScientificRunResult
+        from scientific.contracts.enums import ThermalModelStandard, AgingStandardPreference
+
+        now_utc = datetime.now(timezone.utc)
+        ts = ThermalStateResult(
+            is_computed=True,
+            timestamp=now_utc,
+            asset_id="TX-01",
+            thermal_model_standard=ThermalModelStandard.IEEE,
+            aging_standard=AgingStandardPreference.IEEE,
+        )
+        self.assertTrue(ts.is_computed)
+        self.assertEqual(ts.thermal_model_standard, ThermalModelStandard.IEEE)
+
+        run_res = ScientificRunResult(
+            run_id="run-thermal-001",
+            asset_id="TX-01",
+            time_window_start=now_utc,
+            time_window_end=now_utc,
+            pipeline_version="0.2.0-step5",
+            provenance=ProvenanceMetadata(
+                pipeline_version="0.2.0-step5",
+                execution_timestamp=now_utc,
+                telemetry_digest="b" * 64,
+                asset_id="TX-01",
+            ),
+            validation_summary=ValidationSummary(1, 1, 0, 0, 0, 0),
+            thermal_state=ts,
+        )
+        d = run_res.to_dict()
+        self.assertIsNotNone(d["thermal_state"])
+        self.assertEqual(d["thermal_state"]["thermal_model_standard"], "IEEE")
+        self.assertEqual(d["thermal_state"]["aging_standard"], "IEEE")
+
+
 if __name__ == "__main__":
     unittest.main()
-

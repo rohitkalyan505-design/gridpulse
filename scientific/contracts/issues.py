@@ -74,3 +74,25 @@ class ContractViolationError(ScientificEngineError):
 class AssetSpecError(ScientificEngineError):
     """Raised when a transformer asset specification is invalid or physically impossible."""
     pass
+
+
+class ThermalModelError(ScientificEngineError):
+    """Raised when thermal model parameters or state transitions violate scientific rules."""
+    pass
+
+
+# ==============================================================================
+# Phase 2 Step 5: Thermal & Aging Diagnostic Issue Codes
+# ==============================================================================
+
+ERR_UNSPECIFIED_AGING_STANDARD = "ERR_UNSPECIFIED_AGING_STANDARD"
+ERR_UNSPECIFIED_THERMAL_MODEL_STANDARD = "ERR_UNSPECIFIED_THERMAL_MODEL_STANDARD"
+ERR_UNVALIDATED_THERMAL_PARAMETERS = "ERR_UNVALIDATED_THERMAL_PARAMETERS"
+ERR_INVALID_PARAMETER_VALUE = "ERR_INVALID_PARAMETER_VALUE"
+ERR_INVALID_EXPONENT_RANGE = "ERR_INVALID_EXPONENT_RANGE"
+ERR_UNESTABLISHED_INITIAL_THERMAL_STATE = "ERR_UNESTABLISHED_INITIAL_THERMAL_STATE"
+ERR_UNSAFE_ARRHENIUS_EVALUATION = "ERR_UNSAFE_ARRHENIUS_EVALUATION"
+WARN_UNCONFIGURED_REFERENCE_LIFE = "WARN_UNCONFIGURED_REFERENCE_LIFE"
+WARN_ANOMALOUS_MEASURED_GRADIENT = "WARN_ANOMALOUS_MEASURED_GRADIENT"
+WARN_TELEMETRY_GAP = "WARN_TELEMETRY_GAP"
+WARN_INCOMPLETE_INTEGRATION_WINDOW = "WARN_INCOMPLETE_INTEGRATION_WINDOW"
