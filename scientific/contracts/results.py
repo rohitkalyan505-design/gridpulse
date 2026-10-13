@@ -193,9 +193,9 @@ class ThermalStateResult:
 @dataclass(frozen=True)
 class PhaseImbalanceResult:
     """
-    Contract defining future phase imbalance results.
-    Symmetrical component transformations and unbalance factor formulas
-    are deferred to later steps.
+    Contract defining phase imbalance, symmetrical components, and derating results.
+    Phase 2 Step 6: Phase magnitude unbalance, Fortescue sequence components,
+    negative-sequence ratios (VUF, CUF), neutral current, and evidence-grounded derating.
     """
     is_computed: bool = False
     voltage_unbalance_factor_vuf: Optional[Measurement[float]] = None
@@ -203,6 +203,18 @@ class PhaseImbalanceResult:
     current_unbalance_factor_cuf: Optional[Measurement[float]] = None
     neutral_current_a: Optional[Measurement[float]] = None
     derating_factor_pu: Optional[Measurement[float]] = None
+
+    # Extended Phase 2 Step 6 fields
+    timestamp: Optional[datetime] = None
+    asset_id: Optional[str] = None
+    voltage_magnitude_imbalance: Optional[Any] = None
+    current_magnitude_imbalance: Optional[Any] = None
+    voltage_symmetrical_components: Optional[Any] = None
+    current_symmetrical_components: Optional[Any] = None
+    derating_assessment: Optional[Any] = None
+    issues: List[ProcessingIssue] = field(default_factory=list)
+    calculation_provenance: Dict[str, Any] = field(default_factory=dict)
+
 
 
 @dataclass(frozen=True)

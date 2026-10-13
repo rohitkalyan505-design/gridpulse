@@ -136,3 +136,41 @@ class ParameterSourceClass(str, Enum):
     ASSET_VERIFIED = "ASSET_VERIFIED"
     ENGINEERING_ASSUMPTION = "ENGINEERING_ASSUMPTION"
     UNKNOWN = "UNKNOWN"
+
+
+# ==============================================================================
+# Phase 2 Step 6: Phase Imbalance & Symmetrical Components Enumerations
+# ==============================================================================
+
+class PhaseSequence(str, Enum):
+    """
+    Three-phase sequence rotation convention.
+    Default standard positive sequence is ABC.
+    """
+    ABC = "ABC"
+    ACB = "ACB"
+
+
+class AngleUnit(str, Enum):
+    """Angular unit for AC phasor phase angles."""
+    DEGREES = "DEGREES"
+    RADIANS = "RADIANS"
+
+
+class PhasorAngleConvention(str, Enum):
+    """
+    Phasor angle reference convention.
+    COSINE_REFERENCE: standard v(t) = sqrt(2)*V_rms*cos(omega*t + theta).
+    """
+    COSINE_REFERENCE = "COSINE_REFERENCE"
+
+
+class DeratingMethod(str, Enum):
+    """
+    Supported methodology for transformer derating assessment under unbalanced loading.
+    """
+    MAX_PHASE_CURRENT_CAPACITY = "MAX_PHASE_CURRENT_CAPACITY"
+    LOSS_BASED_NEGATIVE_SEQUENCE = "LOSS_BASED_NEGATIVE_SEQUENCE"
+    MANUFACTURER_CURVE = "MANUFACTURER_CURVE"
+    NONE = "NONE"
+

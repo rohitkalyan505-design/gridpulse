@@ -17,6 +17,10 @@ from scientific.contracts.enums import (
     AgingStandardPreference,
     InsulationSystemType,
     ParameterSourceClass,
+    PhaseSequence,
+    AngleUnit,
+    PhasorAngleConvention,
+    DeratingMethod,
 )
 from scientific.contracts.standards import StandardReference
 from scientific.contracts.measurement import (
@@ -68,6 +72,10 @@ __all__ = [
     "AgingStandardPreference",
     "InsulationSystemType",
     "ParameterSourceClass",
+    "PhaseSequence",
+    "AngleUnit",
+    "PhasorAngleConvention",
+    "DeratingMethod",
     # Standards
     "StandardReference",
     # Measurement & Units
