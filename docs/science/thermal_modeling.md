@@ -210,7 +210,7 @@ Given ordered samples $k = 0, 1, \dots, N-1$ at timestamps $t_0 < t_1 < \dots < 
 
 - **Complete Window:** If all $N-1$ forward intervals in the batch are continuous and valid:
   $$L_{OL, \text{cum}} = \sum_{k=0}^{N-2} \Delta L_{OL, k}$$
-- **Incomplete Window:** If ANY interval in the batch is a continuity gap ($\Delta t > \text{tolerance}$), quarantined, or unconfigured:
+- **Incomplete Window:** If ANY interval in the batch is a continuity gap ($\Delta t > \text{tolerance}$), chronological violation (duplicate or out-of-order timestamp), quarantined, or unconfigured:
   - Cumulative equivalent aging hours is marked `UNKNOWN` (None).
   - Loss-of-life percentage is marked `UNKNOWN` (None).
   - The engine emits `WARN_INCOMPLETE_INTEGRATION_WINDOW`.
@@ -272,6 +272,7 @@ $$\%L_{OL} = \frac{L_{OL, \text{cum}}}{L_{\text{normal}}} \cdot 100\%$$
 | `WARN_ANOMALOUS_MEASURED_GRADIENT`        | `WARNING`  | Physical sensor reports $\theta_{\text{hs}} < \theta_{\text{oil}}$. Raw reading preserved.     |
 | `WARN_TELEMETRY_GAP`                      | `WARNING`  | Telemetry interval exceeded continuity tolerance. Chained ODE state severed.                   |
 | `WARN_INCOMPLETE_INTEGRATION_WINDOW`      | `WARNING`  | Evaluation batch contains gaps or quarantined intervals. Cumulative $L_{OL}$ marked `UNKNOWN`. |
+| `WARN_NON_MONOTONIC_TIMESTAMPS`           | `WARNING`  | Telemetry sequence contains duplicate or out-of-order timestamps. State severed.               |
 
 ---
 

@@ -37,6 +37,7 @@ from scientific.contracts.issues import (
     ProcessingIssue,
     WARN_ANOMALOUS_MEASURED_GRADIENT,
     WARN_INCOMPLETE_INTEGRATION_WINDOW,
+    WARN_NON_MONOTONIC_TIMESTAMPS,
     WARN_TELEMETRY_GAP,
     WARN_UNCONFIGURED_REFERENCE_LIFE,
 )
@@ -159,11 +160,15 @@ class ThermalCalculationEngine:
         n_samples = len(loading_records)
         timestamps: List[datetime] = []
         for i, lr in enumerate(loading_records):
-            # Extract timestamp from loading record
+            # Extract timestamp from loading record with strict precedence:
+            # 1. lr.peak_loading_timestamp
+            # 2. lr.loading_ratio_pu.timestamp (if Measurement exists and has timestamp)
+            # 3. lr.calculation_provenance.get("timestamp")
+            # 4. Fallback: datetime.now(timezone.utc)
             ts = lr.peak_loading_timestamp
+            if ts is None and lr.loading_ratio_pu is not None and lr.loading_ratio_pu.timestamp is not None:
+                ts = lr.loading_ratio_pu.timestamp
             if ts is None:
-                # If peak_loading_timestamp is not set, synthesize or reject
-                # Check calculation_provenance
                 prov_ts = lr.calculation_provenance.get("timestamp")
                 if prov_ts:
                     if isinstance(prov_ts, str):
@@ -176,15 +181,28 @@ class ThermalCalculationEngine:
                 ts = ts.replace(tzinfo=timezone.utc)
             timestamps.append(ts)
 
-        # Check timestamp ordering
+        # Check timestamp ordering and detect duplicate / out-of-order chronology
+        has_chronology_error = False
         for i in range(n_samples - 1):
             if timestamps[i + 1] <= timestamps[i]:
+                has_chronology_error = True
+                if timestamps[i + 1] == timestamps[i]:
+                    msg = (
+                        f"Duplicate timestamp encountered at index {i} and {i+1} "
+                        f"({timestamps[i].isoformat()}). Forward interval duration is zero."
+                    )
+                else:
+                    msg = (
+                        f"Out-of-order timestamp at index {i+1} ({timestamps[i+1].isoformat()}) "
+                        f"precedes earlier timestamp at index {i} ({timestamps[i].isoformat()}). "
+                        f"Chronological sequence violated."
+                    )
                 all_issues.append(
                     ProcessingIssue(
                         stage=STAGE_NAME,
                         severity=IssueSeverity.WARNING,
-                        code="WARN_NON_MONOTONIC_TIMESTAMPS",
-                        message=f"Timestamps between index {i} and {i+1} are not strictly increasing.",
+                        code=WARN_NON_MONOTONIC_TIMESTAMPS,
+                        message=msg,
                         field_name="timestamp",
                     )
                 )
@@ -237,25 +255,57 @@ class ThermalCalculationEngine:
 
             # Forward interval geometry
             if k < n_samples - 1:
-                dt_k_hours = max(0.0, (timestamps[k + 1] - ts_k).total_seconds() / 3600.0)
-                is_gap = dt_k_hours > tolerance_hours
-                if is_gap:
-                    gap_issue = ProcessingIssue(
-                        stage=STAGE_NAME,
-                        severity=IssueSeverity.WARNING,
-                        code=WARN_TELEMETRY_GAP,
-                        message=(
-                            f"Telemetry interval between {ts_k.isoformat()} and {timestamps[k+1].isoformat()} "
-                            f"({dt_k_hours:.3f} h) exceeded tolerance ({tolerance_hours:.3f} h). "
-                            f"Severing continuous thermal state."
-                        ),
-                        field_name="timestamp",
-                    )
-                    step_issues.append(gap_issue)
-                    all_issues.append(gap_issue)
+                is_chronology_break = (timestamps[k + 1] <= ts_k)
+                if is_chronology_break:
+                    dt_k_hours = 0.0
+                    is_gap = False
+                    if timestamps[k + 1] == ts_k:
+                        step_issues.append(
+                            ProcessingIssue(
+                                stage=STAGE_NAME,
+                                severity=IssueSeverity.WARNING,
+                                code=WARN_NON_MONOTONIC_TIMESTAMPS,
+                                message=(
+                                    f"Duplicate timestamp between index {k} and {k+1} "
+                                    f"({ts_k.isoformat()}). Interval cannot be integrated."
+                                ),
+                                field_name="timestamp",
+                            )
+                        )
+                    else:
+                        step_issues.append(
+                            ProcessingIssue(
+                                stage=STAGE_NAME,
+                                severity=IssueSeverity.WARNING,
+                                code=WARN_NON_MONOTONIC_TIMESTAMPS,
+                                message=(
+                                    f"Out-of-order timestamp at index {k+1} ({timestamps[k+1].isoformat()}) "
+                                    f"precedes index {k} ({ts_k.isoformat()}). Interval cannot be integrated."
+                                ),
+                                field_name="timestamp",
+                            )
+                        )
+                else:
+                    dt_k_hours = (timestamps[k + 1] - ts_k).total_seconds() / 3600.0
+                    is_gap = dt_k_hours > tolerance_hours
+                    if is_gap:
+                        gap_issue = ProcessingIssue(
+                            stage=STAGE_NAME,
+                            severity=IssueSeverity.WARNING,
+                            code=WARN_TELEMETRY_GAP,
+                            message=(
+                                f"Telemetry interval between {ts_k.isoformat()} and {timestamps[k+1].isoformat()} "
+                                f"({dt_k_hours:.3f} h) exceeded tolerance ({tolerance_hours:.3f} h). "
+                                f"Severing continuous thermal state."
+                            ),
+                            field_name="timestamp",
+                        )
+                        step_issues.append(gap_issue)
+                        all_issues.append(gap_issue)
             else:
                 dt_k_hours = 0.0
                 is_gap = False
+                is_chronology_break = False
 
             # Check thermal state initialization at sample k
             if k == 0:
@@ -470,7 +520,7 @@ class ThermalCalculationEngine:
 
             if k < n_samples - 1:
                 # Forward interval [t_k, t_{k+1})
-                if aging_standard_valid and not is_gap:
+                if aging_standard_valid and not is_gap and not is_chronology_break:
                     selected_rate = faa_meas if aging_standard == AgingStandardPreference.IEEE else v_meas
                     if selected_rate is not None and selected_rate.value is not None:
                         lol_increment = selected_rate.value * dt_k_hours
@@ -504,7 +554,7 @@ class ThermalCalculationEngine:
                 timestamp_end=ts_end,
                 duration_hours=dt_k_hours,
                 equivalent_aging_hours=interval_lol_meas,
-                is_continuity_break=is_gap,
+                is_continuity_break=(is_gap or is_chronology_break),
                 is_quarantined=is_quarantined,
             )
 
@@ -512,7 +562,7 @@ class ThermalCalculationEngine:
             # 3.5 State Propagation for Next Step k+1
             # ------------------------------------------------------------------
             if k < n_samples - 1:
-                if not is_gap and parameters_valid:
+                if not is_gap and not is_chronology_break and parameters_valid:
                     # Evaluate ultimate rises under loading k_loading
                     if model_standard == ThermalModelStandard.IEEE:
                         oil_u = calculate_ieee_ultimate_top_oil_rise(
@@ -567,7 +617,7 @@ class ThermalCalculationEngine:
                     else:
                         delta_hs_prev = None
                 else:
-                    # Continuity gap or unvalidated parameters severs state
+                    # Continuity gap, chronology break, or unvalidated parameters severs state
                     delta_oil_prev = None
                     delta_hs_prev = None
 
@@ -614,7 +664,7 @@ class ThermalCalculationEngine:
                 insulation_system=input_data.insulation_system,
                 faa_reference_temperature_c=faa_ref_t,
                 v_reference_temperature_c=v_ref_t,
-                is_continuity_break=is_gap,
+                is_continuity_break=(is_gap or is_chronology_break),
                 is_thermal_quarantined=is_quarantined,
                 issues=step_issues,
                 calculation_provenance=provenance,
@@ -627,17 +677,22 @@ class ThermalCalculationEngine:
         cum_lol_meas: Optional[Measurement[float]] = None
         lol_percent_meas: Optional[Measurement[float]] = None
         ref_life_val: Optional[float] = None
-        is_complete: bool = not has_incomplete_interval and aging_standard_valid
+        is_complete: bool = (
+            not has_incomplete_interval
+            and not has_chronology_error
+            and aging_standard_valid
+        )
 
-        if has_incomplete_interval or not aging_standard_valid:
+        if has_incomplete_interval or has_chronology_error or not aging_standard_valid:
             inc_issue = ProcessingIssue(
                 stage=STAGE_NAME,
                 severity=IssueSeverity.WARNING,
                 code=WARN_INCOMPLETE_INTEGRATION_WINDOW,
                 message=(
-                    "Evaluation window contains unobserved telemetry gaps, quarantined intervals, "
-                    "or unconfigured aging standard. Cumulative equivalent aging hours and loss of life "
-                    "percentage cannot be speculatively calculated and are set to UNKNOWN."
+                    "Evaluation window contains unobserved telemetry gaps, chronological errors "
+                    "(duplicate/out-of-order timestamps), quarantined intervals, or unconfigured "
+                    "aging standard. Cumulative equivalent aging hours and loss of life percentage "
+                    "cannot be speculatively calculated and are set to UNKNOWN."
                 ),
                 field_name="cumulative_aging_hours",
             )

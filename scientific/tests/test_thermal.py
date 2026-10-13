@@ -40,6 +40,7 @@ from scientific.contracts.issues import (
     ProcessingIssue,
     WARN_ANOMALOUS_MEASURED_GRADIENT,
     WARN_INCOMPLETE_INTEGRATION_WINDOW,
+    WARN_NON_MONOTONIC_TIMESTAMPS,
     WARN_TELEMETRY_GAP,
     WARN_UNCONFIGURED_REFERENCE_LIFE,
 )
@@ -679,6 +680,168 @@ class TestGroup8NumericalSafety(unittest.TestCase):
         # IEC Non-upgraded at 98 C -> 1.0
         v_non, _, _ = calculate_iec_relative_ageing_rate(98.0, InsulationSystemType.NON_THERMALLY_UPGRADED_PAPER)
         self.assertAlmostEqual(v_non, 1.0, places=6)
+
+
+class TestGroup10TargetedAuditRegression(unittest.TestCase):
+    """Group 10: Targeted audit regressions for F-01 (timestamp precedence) and F-02 (chronology integrity)."""
+
+    def setUp(self):
+        self.engine = ThermalCalculationEngine()
+        self.t0 = datetime(2026, 9, 23, 10, 0, tzinfo=timezone.utc)
+        self.t1 = self.t0 + timedelta(hours=1)
+
+    def test_loading_result_with_only_loading_ratio_timestamp(self):
+        """F-01 Regression: TransformerLoadingResult with only loading_ratio_pu.timestamp preserves deterministic timestamp."""
+        lr0 = TransformerLoadingResult(
+            is_computed=True,
+            loading_ratio_pu=Measurement(
+                value=1.0,
+                unit="pu",
+                evidence=EvidenceClassification.CALCULATED,
+                quality=MeasurementQuality.GOOD,
+                timestamp=self.t0,
+            ),
+            peak_loading_timestamp=None,  # Not provided!
+            calculation_provenance={},    # No provenance timestamp!
+        )
+        lr1 = TransformerLoadingResult(
+            is_computed=True,
+            loading_ratio_pu=Measurement(
+                value=1.0,
+                unit="pu",
+                evidence=EvidenceClassification.CALCULATED,
+                quality=MeasurementQuality.GOOD,
+                timestamp=self.t1,
+            ),
+            peak_loading_timestamp=None,  # Not provided!
+            calculation_provenance={},    # No provenance timestamp!
+        )
+
+        inp = ThermalAnalysisInput(
+            asset_id="TX-01",
+            loading_results=[lr0, lr1],
+            thermal_parameters=make_valid_ieee_params("TX-01"),
+            insulation_system=InsulationSystemType.THERMALLY_UPGRADED_PAPER,
+            thermal_model_standard=ThermalModelStandard.IEEE,
+            aging_standard=AgingStandardPreference.IEEE,
+            measured_hot_spot_series=[110.0, 110.0],
+            continuity_tolerance_seconds=7200.0,
+        )
+        res, issues = self.engine.analyze_batch(inp)
+        self.assertEqual(len(res), 2)
+        # Must strictly use loading_ratio_pu.timestamp (t0 and t1), not datetime.now()!
+        self.assertEqual(res[0].timestamp, self.t0)
+        self.assertEqual(res[1].timestamp, self.t1)
+        self.assertAlmostEqual(res[0].forward_interval_result.duration_hours, 1.0, places=4)
+        self.assertAlmostEqual(res[0].forward_interval_result.equivalent_aging_hours.value, 1.0, places=4)
+        self.assertAlmostEqual(res[0].cumulative_aging_hours.value, 1.0, places=4)
+        self.assertTrue(res[0].is_integration_complete)
+
+    def test_duplicate_timestamps_mark_interval_unknown_and_prevent_cumulative_completeness(self):
+        """F-02 Regression: Duplicate timestamps mark interval unknown and cumulative window incomplete."""
+        # [t0, t0, t0 + 1h]: duplicate between sample 0 and sample 1
+        records = [
+            make_loading_record(1.0, self.t0),
+            make_loading_record(1.0, self.t0),  # Duplicate timestamp!
+            make_loading_record(1.0, self.t1),
+        ]
+        inp = ThermalAnalysisInput(
+            asset_id="TX-01",
+            loading_results=records,
+            thermal_parameters=make_valid_ieee_params("TX-01"),
+            insulation_system=InsulationSystemType.THERMALLY_UPGRADED_PAPER,
+            thermal_model_standard=ThermalModelStandard.IEEE,
+            aging_standard=AgingStandardPreference.IEEE,
+            measured_hot_spot_series=[110.0, 110.0, 110.0],
+            continuity_tolerance_seconds=7200.0,
+        )
+        res, issues = self.engine.analyze_batch(inp)
+        self.assertEqual(len(res), 3)
+
+        # Issues must contain WARN_NON_MONOTONIC_TIMESTAMPS and WARN_INCOMPLETE_INTEGRATION_WINDOW
+        self.assertTrue(any(i.code == WARN_NON_MONOTONIC_TIMESTAMPS for i in issues))
+        self.assertTrue(any(i.code == WARN_INCOMPLETE_INTEGRATION_WINDOW for i in issues))
+
+        # Interval 0 [t0, t0): duplicate duration 0.0, marked as continuity break, equivalent aging UNKNOWN (None)
+        self.assertEqual(res[0].forward_interval_result.duration_hours, 0.0)
+        self.assertTrue(res[0].forward_interval_result.is_continuity_break)
+        self.assertIsNone(res[0].forward_interval_result.equivalent_aging_hours)
+
+        # Cumulative window must be UNKNOWN and incomplete
+        self.assertIsNone(res[0].cumulative_aging_hours)
+        self.assertIsNone(res[0].loss_of_life_percent)
+        self.assertFalse(res[0].is_integration_complete)
+
+    def test_out_of_order_timestamps_mark_interval_unknown_and_prevent_cumulative_completeness(self):
+        """F-02 Regression: Out-of-order timestamps mark interval unknown and cumulative window incomplete."""
+        # [t0, t0 + 2h, t0 + 1h]: sample 2 precedes sample 1!
+        t2_out_of_order = self.t0 + timedelta(hours=2)
+        records = [
+            make_loading_record(1.0, self.t0),
+            make_loading_record(1.0, t2_out_of_order),
+            make_loading_record(1.0, self.t1),  # Earlier than preceding sample!
+        ]
+        inp = ThermalAnalysisInput(
+            asset_id="TX-01",
+            loading_results=records,
+            thermal_parameters=make_valid_ieee_params("TX-01"),
+            insulation_system=InsulationSystemType.THERMALLY_UPGRADED_PAPER,
+            thermal_model_standard=ThermalModelStandard.IEEE,
+            aging_standard=AgingStandardPreference.IEEE,
+            measured_hot_spot_series=[110.0, 110.0, 110.0],
+            continuity_tolerance_seconds=7200.0,
+        )
+        res, issues = self.engine.analyze_batch(inp)
+        self.assertEqual(len(res), 3)
+
+        self.assertTrue(any(i.code == WARN_NON_MONOTONIC_TIMESTAMPS for i in issues))
+        self.assertTrue(any(i.code == WARN_INCOMPLETE_INTEGRATION_WINDOW for i in issues))
+
+        # Interval 1 [t2, t1) has time reversal: duration clamped to 0.0, marked break, equivalent aging UNKNOWN
+        self.assertEqual(res[1].forward_interval_result.duration_hours, 0.0)
+        self.assertTrue(res[1].forward_interval_result.is_continuity_break)
+        self.assertIsNone(res[1].forward_interval_result.equivalent_aging_hours)
+
+        # Cumulative window must be UNKNOWN and incomplete
+        self.assertIsNone(res[0].cumulative_aging_hours)
+        self.assertIsNone(res[0].loss_of_life_percent)
+        self.assertFalse(res[0].is_integration_complete)
+
+    def test_valid_prior_intervals_preserved_for_audit_while_cumulative_remains_unknown(self):
+        """F-02 Regression: Valid intervals before a chronology break are preserved for audit, but cumulative is UNKNOWN."""
+        t2 = self.t1 + timedelta(hours=1)
+        # [t0, t1, t1, t2]: interval 0 is valid [t0, t1), interval 1 is duplicate [t1, t1), interval 2 is valid [t1, t2)
+        records = [
+            make_loading_record(1.0, self.t0),
+            make_loading_record(1.0, self.t1),
+            make_loading_record(1.0, self.t1),  # Duplicate
+            make_loading_record(1.0, t2),
+        ]
+        inp = ThermalAnalysisInput(
+            asset_id="TX-01",
+            loading_results=records,
+            thermal_parameters=make_valid_ieee_params("TX-01"),
+            insulation_system=InsulationSystemType.THERMALLY_UPGRADED_PAPER,
+            thermal_model_standard=ThermalModelStandard.IEEE,
+            aging_standard=AgingStandardPreference.IEEE,
+            measured_hot_spot_series=[110.0, 110.0, 110.0, 110.0],
+            continuity_tolerance_seconds=7200.0,
+        )
+        res, issues = self.engine.analyze_batch(inp)
+        self.assertEqual(len(res), 4)
+
+        # Interval 0 [t0, t1): 1.0 h duration, valid 1.0 h equivalent aging preserved
+        self.assertIsNotNone(res[0].forward_interval_result.equivalent_aging_hours)
+        self.assertAlmostEqual(res[0].forward_interval_result.equivalent_aging_hours.value, 1.0, places=4)
+        self.assertFalse(res[0].forward_interval_result.is_continuity_break)
+
+        # Interval 1 [t1, t1): duplicate, equivalent aging UNKNOWN
+        self.assertIsNone(res[1].forward_interval_result.equivalent_aging_hours)
+        self.assertTrue(res[1].forward_interval_result.is_continuity_break)
+
+        # Cumulative across batch must be UNKNOWN due to chronological flaw
+        self.assertIsNone(res[0].cumulative_aging_hours)
+        self.assertFalse(res[0].is_integration_complete)
 
 
 if __name__ == "__main__":
