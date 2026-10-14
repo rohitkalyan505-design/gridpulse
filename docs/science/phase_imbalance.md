@@ -260,7 +260,7 @@ python -m unittest discover -s scientific -p "test_*.py" -v
 ```
 
 **Results:**
-- Total tests: **162 passed** (119 historical Steps 1–5 + 43 Step 6 tests).
+- Total tests: **163 passed** (119 historical Steps 1–5 + 44 Step 6 tests).
 - Regression suite: 17 dedicated Step 6 audit regression tests covering F-01 through F-07.
 - Skipped / Failed: **0**.
 - Execution duration: ~0.51s (pytest) / ~0.04s (unittest).
