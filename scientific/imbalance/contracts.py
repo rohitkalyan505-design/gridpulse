@@ -6,24 +6,23 @@ Part of Phase 2 Step 6.
 """
 
 from dataclasses import dataclass, field
-from datetime import datetime, timezone
+from datetime import datetime
 import math
-from typing import Any, Dict, List, Optional, Tuple, Union
+from typing import Any, Dict, List, Optional, Union
 
 from scientific.contracts.asset import OperationalLimits, TransformerAssetSpec
 from scientific.contracts.enums import (
-    AngleUnit,
     DeratingMethod,
     EvidenceClassification,
     MeasurementQuality,
+    ParameterSourceClass,
     PhaseIdentification,
     PhaseSequence,
     PhasorAngleConvention,
 )
-from scientific.contracts.measurement import CANONICAL_UNITS, Measurement
+from scientific.contracts.measurement import Measurement
 from scientific.contracts.results import (
     ElectricalFeaturesResult,
-    PhaseImbalanceResult,
     TransformerLoadingResult,
 )
 
@@ -296,7 +295,8 @@ class PhaseMagnitudeImbalance:
     """
     Deterministic phase magnitude unbalance metrics.
     Calculates arithmetic mean, signed deviations, absolute deviations,
-    and maximum deviation percentage using the documented mean-based denominator.
+    maximum absolute deviation, and percentage deviation using the documented mean-based denominator.
+    Also retains the true maximum phase magnitude.
     """
     quantity_type: str  # "VOLTAGE" or "CURRENT"
     mean_magnitude: Measurement[float]
@@ -305,7 +305,47 @@ class PhaseMagnitudeImbalance:
     max_absolute_deviation: Measurement[float]
     max_deviation_percent: Optional[Measurement[float]]
     denominator_definition: str = "THREE_PHASE_ARITHMETIC_MEAN"
+    max_phase_magnitude: Optional[Measurement[float]] = None
     is_valid: bool = True
+
+
+@dataclass(frozen=True)
+class ParameterWithProvenance:
+    """
+    Type-safe representation of an engineering parameter with verifiable provenance.
+    Enforces that safety-sensitive derating calculations only consume verified parameters
+    originating from approved, verified documentation (e.g., factory test report).
+    Bare floats and unverified parameters are strictly rejected.
+    """
+    parameter_name: str
+    value: float
+    unit: str
+    source_class: Union[ParameterSourceClass, str]
+    reference_document: str = ""
+    is_verified: bool = False
+    applicable_asset_id: str = ""
+    validity_conditions: Dict[str, Any] = field(default_factory=dict)
+
+    def __post_init__(self) -> None:
+        if not math.isfinite(self.value):
+            raise ValueError(f"Parameter '{self.parameter_name}' value must be finite, got {self.value}.")
+
+    def is_approved_for_provenance(self) -> bool:
+        """
+        Returns True only if the parameter originates from an approved verified source.
+        ENGINEERING_ASSUMPTION and UNKNOWN are strictly rejected.
+        """
+        src = (
+            self.source_class.value
+            if isinstance(self.source_class, ParameterSourceClass)
+            else str(self.source_class)
+        )
+        return self.is_verified and src in {
+            ParameterSourceClass.FACTORY_TEST.value,
+            ParameterSourceClass.MANUFACTURER_DOCUMENT.value,
+            ParameterSourceClass.ASSET_VERIFIED.value,
+            "NAMEPLATE",
+        }
 
 
 @dataclass(frozen=True)
@@ -337,11 +377,24 @@ class DeratingConfiguration:
     """
     Configuration parameters for transformer derating under unbalanced loading.
     Requires explicit method selection and verified asset parameters.
+    Bare floats and unverified parameter inputs are strictly rejected.
     """
     method: DeratingMethod = DeratingMethod.MAX_PHASE_CURRENT_CAPACITY
-    loss_ratio_r: Optional[float] = None  # Load loss to no-load loss ratio
-    eddy_loss_factor_pec: Optional[float] = None  # Winding eddy current loss factor
+    loss_ratio_r: Optional[ParameterWithProvenance] = None  # Load loss to no-load loss ratio
+    eddy_loss_factor_pec: Optional[ParameterWithProvenance] = None  # Winding eddy current loss factor
     manufacturer_curve_points: Optional[Dict[float, float]] = None
+
+    def __post_init__(self) -> None:
+        if self.loss_ratio_r is not None and not isinstance(self.loss_ratio_r, ParameterWithProvenance):
+            raise TypeError(
+                f"loss_ratio_r must be an instance of ParameterWithProvenance or None, "
+                f"got {type(self.loss_ratio_r).__name__}. Bare floats are prohibited."
+            )
+        if self.eddy_loss_factor_pec is not None and not isinstance(self.eddy_loss_factor_pec, ParameterWithProvenance):
+            raise TypeError(
+                f"eddy_loss_factor_pec must be an instance of ParameterWithProvenance or None, "
+                f"got {type(self.eddy_loss_factor_pec).__name__}. Bare floats are prohibited."
+            )
 
 
 @dataclass(frozen=True)

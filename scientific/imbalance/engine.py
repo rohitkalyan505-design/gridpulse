@@ -5,19 +5,11 @@ neutral current evaluation, and evidence-grounded transformer derating.
 Part of Phase 2 Step 6.
 """
 
-from datetime import datetime, timezone
 from typing import Any, Dict, List, Optional, Tuple
 
 from scientific.contracts.asset import OperationalLimits, TransformerAssetSpec
-from scientific.contracts.enums import (
-    DeratingMethod,
-    EvidenceClassification,
-    IssueSeverity,
-    MeasurementQuality,
-    PhaseIdentification,
-    PhaseSequence,
-)
-from scientific.contracts.issues import ProcessingIssue
+from scientific.contracts.enums import IssueSeverity
+from scientific.contracts.issues import ERR_MISSING_TIMESTAMP, ProcessingIssue
 from scientific.contracts.measurement import Measurement
 from scientific.contracts.results import PhaseImbalanceResult
 from scientific.imbalance.calculations import (
@@ -27,10 +19,8 @@ from scientific.imbalance.calculations import (
 )
 from scientific.imbalance.contracts import (
     DeratingAssessmentResult,
-    DeratingConfiguration,
     PhaseImbalanceInput,
     PhaseMagnitudeImbalance,
-    PhaseQuantity,
     SymmetricalComponentsResult,
     ThreePhaseQuantity,
 )
@@ -97,7 +87,7 @@ class PhaseImbalanceEngine:
                     timestamp=ts,
                 )
 
-        # Establish effective timestamp and asset_id
+        # Establish effective timestamp and asset_id deterministically (F-06: no wall-clock fallback)
         calc_ts = (
             v_three_phase.timestamp
             if v_three_phase and v_three_phase.timestamp
@@ -106,11 +96,29 @@ class PhaseImbalanceEngine:
                 if i_three_phase and i_three_phase.timestamp
                 else (
                     input_data.loading.loading_ratio_pu.timestamp
-                    if input_data.loading and input_data.loading.loading_ratio_pu
-                    else datetime.now(timezone.utc)
+                    if input_data.loading and input_data.loading.loading_ratio_pu and input_data.loading.loading_ratio_pu.timestamp
+                    else None
                 )
             )
         )
+        if calc_ts is None:
+            issues.append(
+                ProcessingIssue(
+                    stage=STAGE_NAME,
+                    severity=IssueSeverity.CRITICAL,
+                    code=ERR_MISSING_TIMESTAMP,
+                    message="No valid deterministic timestamp found in input data. Telemetry timestamps cannot be manufactured from wall-clock.",
+                )
+            )
+            return (
+                PhaseImbalanceResult(
+                    is_computed=False,
+                    issues=issues,
+                    calculation_provenance={"pipeline_stage": STAGE_NAME, "status": "REJECTED_MISSING_TIMESTAMP"},
+                ),
+                issues,
+            )
+
         asset_id = eff_spec.asset_id if eff_spec else ""
 
         # 3. Voltage Magnitude Imbalance
@@ -153,7 +161,7 @@ class PhaseImbalanceEngine:
             )
             issues.extend(i_sym_issues)
 
-        # 7. Derating Assessment
+        # 7. Derating Assessment (F-01: passes current_three_phase)
         derating_res: Optional[DeratingAssessmentResult] = None
         if eff_spec is not None:
             derating_res, derating_issues = calculate_transformer_derating(
@@ -165,6 +173,7 @@ class PhaseImbalanceEngine:
                 operational_limits=eff_limits,
                 derating_config=input_data.derating_config,
                 timestamp=calc_ts,
+                current_three_phase=i_three_phase,
                 stage_name=STAGE_NAME,
             )
             issues.extend(derating_issues)

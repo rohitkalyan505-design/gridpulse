@@ -34,9 +34,9 @@ Formulations:
 """
 
 import cmath
-from datetime import datetime, timezone
+from datetime import datetime
 import math
-from typing import Any, Dict, List, Optional, Tuple
+from typing import List, Optional, Tuple
 
 from scientific.contracts.asset import OperationalLimits, TransformerAssetSpec
 from scientific.contracts.enums import (
@@ -44,17 +44,18 @@ from scientific.contracts.enums import (
     EvidenceClassification,
     IssueSeverity,
     MeasurementQuality,
-    PhaseIdentification,
+    ParameterSourceClass,
     PhaseSequence,
-    PhasorAngleConvention,
 )
 from scientific.contracts.issues import (
     ERR_DEGENERATE_POSITIVE_SEQUENCE,
     ERR_INCOMPLETE_THREE_PHASE_TELEMETRY,
-    ERR_INVALID_PHASE_IDENTIFICATION,
     ERR_INVALID_PHASE_SEQUENCE,
     ERR_MISMATCHED_PHASE_TIMESTAMPS,
     ERR_MISSING_PHASOR_ANGLES,
+    ERR_MISSING_TIMESTAMP,
+    ERR_RECONSTRUCTION_TOLERANCE_EXCEEDED,
+    ERR_UNVALIDATED_DERATING_PARAMETERS,
     ProcessingIssue,
     WARN_CURRENT_UNBALANCE_EXCEEDS_LIMIT,
     WARN_DERATING_METHOD_UNAVAILABLE,
@@ -62,13 +63,13 @@ from scientific.contracts.issues import (
     WARN_VOLTAGE_UNBALANCE_EXCEEDS_LIMIT,
     WARN_ZERO_MEAN_MAGNITUDE,
 )
-from scientific.contracts.measurement import CANONICAL_UNITS, Measurement
+from scientific.contracts.measurement import Measurement
 from scientific.imbalance.contracts import (
     ComplexPhasor,
     DeratingAssessmentResult,
     DeratingConfiguration,
+    ParameterWithProvenance,
     PhaseMagnitudeImbalance,
-    PhaseQuantity,
     SymmetricalComponentsResult,
     ThreePhaseQuantity,
 )
@@ -166,6 +167,33 @@ def calculate_phase_magnitude_imbalance(
     ts_a = p_a.magnitude.timestamp
     ts_b = p_b.magnitude.timestamp
     ts_c = p_c.magnitude.timestamp
+
+    if ts_a is None or ts_b is None or ts_c is None:
+        issues.append(
+            ProcessingIssue(
+                stage=stage_name,
+                severity=IssueSeverity.CRITICAL,
+                code=ERR_MISSING_TIMESTAMP,
+                message="Missing phase timestamp. Cannot compute magnitude imbalance without synchronized timing.",
+                field_name=f"{quantity_type.lower()}_timestamp",
+                timestamp=ts,
+            )
+        )
+        return None, issues
+
+    if ts_a.tzinfo is None or ts_b.tzinfo is None or ts_c.tzinfo is None:
+        issues.append(
+            ProcessingIssue(
+                stage=stage_name,
+                severity=IssueSeverity.CRITICAL,
+                code="ERR_TIMEZONE_NAIVE",
+                message="Phase timestamps must be timezone-aware (strictly UTC).",
+                field_name=f"{quantity_type.lower()}_timestamp",
+                timestamp=ts,
+            )
+        )
+        return None, issues
+
     max_ts_diff = max(
         abs((ts_a - ts_b).total_seconds()),
         abs((ts_b - ts_c).total_seconds()),
@@ -327,6 +355,16 @@ def calculate_phase_magnitude_imbalance(
             },
         )
 
+    max_phase_val = max(val_a, val_b, val_c)
+    max_phase_meas = Measurement(
+        value=max_phase_val,
+        unit=unit_a,
+        evidence=evidence,
+        quality=quality,
+        timestamp=ts,
+        metadata={"formula": "max(Xa, Xb, Xc)"},
+    )
+
     return (
         PhaseMagnitudeImbalance(
             quantity_type=quantity_type,
@@ -336,6 +374,7 @@ def calculate_phase_magnitude_imbalance(
             max_absolute_deviation=max_dev_meas,
             max_deviation_percent=percent_dev_meas,
             denominator_definition="THREE_PHASE_ARITHMETIC_MEAN",
+            max_phase_magnitude=max_phase_meas,
             is_valid=True,
         ),
         issues,
@@ -397,6 +436,57 @@ def calculate_symmetrical_components(
         return None, issues
 
     # 3. Unit and timestamp consistency
+    ts_a = three_phase.phase_a.timestamp
+    ts_b = three_phase.phase_b.timestamp
+    ts_c = three_phase.phase_c.timestamp
+
+    if ts_a is None or ts_b is None or ts_c is None:
+        issues.append(
+            ProcessingIssue(
+                stage=stage_name,
+                severity=IssueSeverity.CRITICAL,
+                code=ERR_MISSING_TIMESTAMP,
+                message="Missing phase timestamp. Cannot compute symmetrical components without synchronized timing.",
+                field_name=f"{quantity_type.lower()}_timestamp",
+                timestamp=ts,
+            )
+        )
+        return None, issues
+
+    if ts_a.tzinfo is None or ts_b.tzinfo is None or ts_c.tzinfo is None:
+        issues.append(
+            ProcessingIssue(
+                stage=stage_name,
+                severity=IssueSeverity.CRITICAL,
+                code="ERR_TIMEZONE_NAIVE",
+                message="Phase timestamps must be timezone-aware (strictly UTC).",
+                field_name=f"{quantity_type.lower()}_timestamp",
+                timestamp=ts,
+            )
+        )
+        return None, issues
+
+    max_ts_diff = max(
+        abs((ts_a - ts_b).total_seconds()),
+        abs((ts_b - ts_c).total_seconds()),
+        abs((ts_a - ts_c).total_seconds()),
+    )
+    if max_ts_diff > 1.0:
+        issues.append(
+            ProcessingIssue(
+                stage=stage_name,
+                severity=IssueSeverity.CRITICAL,
+                code=ERR_MISMATCHED_PHASE_TIMESTAMPS,
+                message=(
+                    f"Phase phasor timestamps diverge by {max_ts_diff:.3f} s (> 1.0 s). "
+                    f"Cannot combine asynchronous phase measurements into symmetrical components."
+                ),
+                field_name=f"{quantity_type.lower()}_timestamp",
+                timestamp=ts,
+            )
+        )
+        return None, issues
+
     unit = three_phase.phase_a.unit
     if not (three_phase.phase_b.unit == unit == three_phase.phase_c.unit):
         issues.append(
@@ -460,6 +550,22 @@ def calculate_symmetrical_components(
     err_b = abs(c_b - cb_rec)
     err_c = abs(c_c - cc_rec)
     max_recon_err = max(err_a, err_b, err_c)
+
+    if not math.isfinite(max_recon_err) or max_recon_err > RECONSTRUCTION_TOLERANCE:
+        issues.append(
+            ProcessingIssue(
+                stage=stage_name,
+                severity=IssueSeverity.CRITICAL,
+                code=ERR_RECONSTRUCTION_TOLERANCE_EXCEEDED,
+                message=(
+                    f"Symmetrical component reconstruction residual ({max_recon_err:.6e} {unit}) "
+                    f"exceeds tolerance ({RECONSTRUCTION_TOLERANCE:.1e} {unit}). Sequence transformation invalid."
+                ),
+                field_name=f"{quantity_type.lower()}_symmetrical_reconstruction",
+                timestamp=ts,
+            )
+        )
+        return None, issues
 
     # 6. Magnitudes and Phase Angles
     mag_0 = abs(x0)
@@ -611,20 +717,45 @@ def calculate_transformer_derating(
     operational_limits: Optional[OperationalLimits] = None,
     derating_config: Optional[DeratingConfiguration] = None,
     timestamp: Optional[datetime] = None,
+    current_three_phase: Optional[ThreePhaseQuantity] = None,
     stage_name: str = "derating_analysis",
 ) -> Tuple[Optional[DeratingAssessmentResult], List[ProcessingIssue]]:
     """
     Evidence-grounded transformer derating calculation under unbalanced loading.
     Evaluates:
-    1. Maximum phase current capacity derating method (deterministic conductor capacity limit).
-    2. Loss-based negative-sequence method (requires verified factory test loss ratios).
-    3. Operational limit violations for voltage and current unbalance.
-    Explicitly refuses to apply NEMA MG-1 induction motor derating to static transformers.
+    1. Maximum phase current capacity method (deterministic conductor throughput constraint).
+    2. Operational limit violations for voltage and current unbalance.
+    Explicitly refuses to evaluate unverified negative-sequence loss formulations or motor derating curves.
     """
     issues: List[ProcessingIssue] = []
-    ts = timestamp or datetime.now(timezone.utc)
     config = derating_config or DeratingConfiguration()
     recs: List[str] = []
+
+    # Deterministic timestamp validation (F-06): no wall-clock fallback
+    if timestamp is None:
+        issues.append(
+            ProcessingIssue(
+                stage=stage_name,
+                severity=IssueSeverity.CRITICAL,
+                code=ERR_MISSING_TIMESTAMP,
+                message="Derating calculation requires a valid deterministic timestamp. Wall-clock fallback prohibited.",
+                field_name="timestamp",
+                timestamp=None,
+            )
+        )
+        return (
+            DeratingAssessmentResult(
+                derating_factor_pu=None,
+                method_applied=config.method,
+                is_derated=False,
+                status="UNKNOWN",
+                applicability_notes="Missing deterministic timestamp; calculation aborted.",
+                limitations="Chronology cannot be manufactured from wall-clock time.",
+                engineering_recommendations=recs,
+            ),
+            issues,
+        )
+    ts = timestamp
 
     # 1. Operational limit checks
     limits = operational_limits or asset_spec.operational_limits
@@ -689,7 +820,7 @@ def calculate_transformer_derating(
                     stage=stage_name,
                     severity=IssueSeverity.WARNING,
                     code=WARN_DERATING_METHOD_UNAVAILABLE,
-                    message="Current magnitude imbalance is unavailable; cannot compute maximum-phase derating.",
+                    message="Current magnitude imbalance is unavailable; cannot compute conductor throughput constraint.",
                     field_name="derating_factor",
                     timestamp=ts,
                 )
@@ -700,7 +831,7 @@ def calculate_transformer_derating(
                     method_applied=DeratingMethod.MAX_PHASE_CURRENT_CAPACITY,
                     is_derated=False,
                     status="UNKNOWN",
-                    applicability_notes="Conductor thermal limit method requires valid three-phase current telemetry.",
+                    applicability_notes="Conductor throughput constraint requires valid three-phase current telemetry.",
                     limitations="Missing current measurements prevent evaluating phase conductor loading.",
                     engineering_recommendations=recs,
                 ),
@@ -708,34 +839,106 @@ def calculate_transformer_derating(
             )
 
         mean_i = current_imbalance.mean_magnitude.value
-        max_dev_i = current_imbalance.max_absolute_deviation.value
 
-        if mean_i <= 0.0:
+        # Calculate true maximum phase current from validated phase currents (F-01)
+        if current_three_phase is not None and current_three_phase.is_complete_three_phase:
+            i_max = max(
+                current_three_phase.phase_a.magnitude.value,
+                current_three_phase.phase_b.magnitude.value,
+                current_three_phase.phase_c.magnitude.value,
+            )
+        elif current_imbalance.max_phase_magnitude is not None:
+            i_max = current_imbalance.max_phase_magnitude.value
+        elif current_imbalance.deviations_signed and len(current_imbalance.deviations_signed) == 3:
+            i_max = max(
+                mean_i + current_imbalance.deviations_signed[p].value
+                for p in ("A", "B", "C")
+            )
+        else:
+            i_max = mean_i + current_imbalance.max_absolute_deviation.value
+
+        if not math.isfinite(i_max) or i_max < 0.0:
+            issues.append(
+                ProcessingIssue(
+                    stage=stage_name,
+                    severity=IssueSeverity.CRITICAL,
+                    code="ERR_PHYSICAL_BOUNDARY",
+                    message=f"Non-finite or negative maximum phase current ({i_max} A).",
+                    field_name="derating_factor",
+                    timestamp=ts,
+                )
+            )
+            return (
+                DeratingAssessmentResult(
+                    derating_factor_pu=None,
+                    method_applied=DeratingMethod.MAX_PHASE_CURRENT_CAPACITY,
+                    is_derated=False,
+                    status="UNKNOWN",
+                    applicability_notes="Invalid current inputs.",
+                    limitations="Non-physical phase current.",
+                    engineering_recommendations=recs,
+                ),
+                issues,
+            )
+
+        if mean_i <= 0.0 or i_max <= 0.0:
             derate_pu = 1.0
             is_derated = False
         else:
-            # Maximum phase current: I_max = mean_i + max_dev_i
-            # Derating factor = mean_i / I_max = 1 / (1 + max_dev_i / mean_i)
-            i_max = mean_i + max_dev_i
-            derate_pu = min(1.0, mean_i / i_max) if i_max > 0.0 else 1.0
+            # Conductor-current throughput constraint: k_derate = mean_i / max(Ia, Ib, Ic)
+            derate_pu = min(1.0, mean_i / i_max)
             is_derated = derate_pu < 0.999
+
+        # Conservative evidence propagation (F-07)
+        ev_inputs = []
+        qual_inputs = []
+        if current_three_phase is not None:
+            ev_inputs.extend([
+                current_three_phase.phase_a.evidence,
+                current_three_phase.phase_b.evidence,
+                current_three_phase.phase_c.evidence,
+            ])
+            qual_inputs.extend([
+                current_three_phase.phase_a.quality,
+                current_three_phase.phase_b.quality,
+                current_three_phase.phase_c.quality,
+            ])
+        elif current_imbalance is not None:
+            ev_inputs.append(current_imbalance.mean_magnitude.evidence)
+            qual_inputs.append(current_imbalance.mean_magnitude.quality)
+
+        derate_evidence = (
+            EvidenceClassification.MODELED
+            if any(e == EvidenceClassification.MODELED for e in ev_inputs)
+            else EvidenceClassification.CALCULATED
+        )
+        derate_quality = (
+            MeasurementQuality.SUSPECT
+            if any(q == MeasurementQuality.SUSPECT for q in qual_inputs)
+            else MeasurementQuality.GOOD
+        )
 
         meas_derate = Measurement(
             value=derate_pu,
             unit="pu",
-            evidence=EvidenceClassification.CALCULATED,
-            quality=current_imbalance.mean_magnitude.quality,
+            evidence=derate_evidence,
+            quality=derate_quality,
             timestamp=ts,
             metadata={
                 "method": "MAX_PHASE_CURRENT_CAPACITY",
-                "formula": "mean_current / max_phase_current",
+                "formula": "mean_current / max(Ia, Ib, Ic)",
+                "constraint_type": "CONDUCTOR_CURRENT_THROUGHPUT_LIMIT",
+                "is_universal_thermal_derating": False,
+                "mean_current_a": mean_i,
+                "max_phase_current_a": i_max,
                 "rationale": "Prevents individual phase conductor thermal limit exceedance under asymmetrical load.",
             },
         )
 
         if is_derated:
             recs.append(
-                f"Derate transformer nameplate capacity to {derate_pu * 100:.1f}% ({derate_pu:.3f} pu) to avoid exceeding single-phase conductor thermal ratings."
+                f"Constrain transformer three-phase throughput to {derate_pu * 100:.1f}% ({derate_pu:.3f} pu) "
+                f"so that Phase with {i_max:.1f} A does not exceed rated single-conductor current rating."
             )
 
         return (
@@ -745,104 +948,108 @@ def calculate_transformer_derating(
                 is_derated=is_derated,
                 status="CALCULATED",
                 applicability_notes=(
-                    "Applicable to distribution transformers operating under asymmetrical single-phase load. "
-                    "Constrains total three-phase throughput so the most heavily loaded phase does not exceed rated current."
+                    "Conductor-current throughput constraint under asymmetrical loading. "
+                    "Constrains total three-phase throughput so the most heavily loaded phase does not exceed rated current. "
+                    "This is a conductor throughput limit, NOT a universal transformer nameplate thermal derating recommendation."
                 ),
-                limitations="Evaluates fundamental-frequency phase current magnitude only; does not model localized stray flux or tank heating.",
+                limitations=(
+                    "Evaluates fundamental-frequency phase current magnitude only; does not model localized stray flux, "
+                    "core saturation, or zero-sequence tank heating."
+                ),
                 engineering_recommendations=recs,
             ),
             issues,
         )
 
     elif method == DeratingMethod.LOSS_BASED_NEGATIVE_SEQUENCE:
-        # Requires verified asset test parameters (loss ratio R and eddy-current loss factor PEC)
-        r = config.loss_ratio_r
-        pec = config.eddy_loss_factor_pec
+        # Validate parameter provenance if supplied (F-03)
+        r_param = config.loss_ratio_r
+        pec_param = config.eddy_loss_factor_pec
 
-        if r is None or pec is None:
-            issues.append(
-                ProcessingIssue(
-                    stage=stage_name,
-                    severity=IssueSeverity.WARNING,
-                    code=WARN_UNVERIFIED_DERATING_PARAMETERS,
-                    message=(
-                        "Loss-based negative-sequence derating requires verified factory test parameters: "
-                        "loss ratio (R) and eddy current loss factor (PEC). Parameters unavailable; returning UNKNOWN."
-                    ),
-                    field_name="derating_parameters",
-                    timestamp=ts,
-                )
-            )
-            recs.append("Obtain factory test report with load-loss ratio and eddy-loss factor to compute loss-based derating.")
-            return (
-                DeratingAssessmentResult(
-                    derating_factor_pu=None,
-                    method_applied=DeratingMethod.LOSS_BASED_NEGATIVE_SEQUENCE,
-                    is_derated=False,
-                    status="UNVERIFIED",
-                    applicability_notes="Requires verified factory test report parameters.",
-                    limitations="Parameters unverified; standard practice prohibits speculative loss coefficients.",
-                    engineering_recommendations=recs,
-                ),
-                issues,
-            )
-
-        # If parameters present and symmetrical current available:
-        if current_symmetrical and current_symmetrical.negative_sequence_ratio_percent:
-            cuf = current_symmetrical.negative_sequence_ratio_percent.value / 100.0
-            # Additional loss factor: 1 + pec * cuf^2
-            additional_loss_factor = 1.0 + pec * (cuf ** 2)
-            derate_pu = min(1.0, math.sqrt((1.0 + r) / (1.0 + r * additional_loss_factor)))
-            is_derated = derate_pu < 0.999
-
-            meas_derate = Measurement(
-                value=derate_pu,
-                unit="pu",
-                evidence=EvidenceClassification.CALCULATED,
-                quality=current_symmetrical.negative_sequence_ratio_percent.quality,
-                timestamp=ts,
-                metadata={
-                    "method": "LOSS_BASED_NEGATIVE_SEQUENCE",
-                    "loss_ratio_r": r,
-                    "eddy_loss_factor_pec": pec,
-                    "cuf_pu": cuf,
-                },
-            )
-            return (
-                DeratingAssessmentResult(
-                    derating_factor_pu=meas_derate,
-                    method_applied=DeratingMethod.LOSS_BASED_NEGATIVE_SEQUENCE,
-                    is_derated=is_derated,
-                    status="CALCULATED",
-                    applicability_notes="Derived from verified factory loss ratio and negative-sequence eddy losses.",
-                    limitations="Assumes uniform loss distribution across winding coils.",
-                    engineering_recommendations=recs,
-                ),
-                issues,
-            )
+        if r_param is not None or pec_param is not None:
+            for p_obj, p_name in [(r_param, "loss_ratio_r"), (pec_param, "eddy_loss_factor_pec")]:
+                if p_obj is not None:
+                    if not isinstance(p_obj, ParameterWithProvenance):
+                        issues.append(
+                            ProcessingIssue(
+                                stage=stage_name,
+                                severity=IssueSeverity.CRITICAL,
+                                code=ERR_UNVALIDATED_DERATING_PARAMETERS,
+                                message=f"Parameter '{p_name}' must be encapsulated in ParameterWithProvenance; bare floats prohibited.",
+                                field_name=p_name,
+                                timestamp=ts,
+                            )
+                        )
+                    else:
+                        src = (
+                            p_obj.source_class.value
+                            if isinstance(p_obj.source_class, ParameterSourceClass)
+                            else str(p_obj.source_class)
+                        )
+                        # Check suitability: loss ratio and eddy factor cannot be established by nameplates
+                        if src == "NAMEPLATE":
+                            issues.append(
+                                ProcessingIssue(
+                                    stage=stage_name,
+                                    severity=IssueSeverity.CRITICAL,
+                                    code=ERR_UNVALIDATED_DERATING_PARAMETERS,
+                                    message=f"Source 'NAMEPLATE' is unsuitable for '{p_name}'. Loss parameters must originate from FACTORY_TEST or MANUFACTURER_DOCUMENT.",
+                                    field_name=p_name,
+                                    timestamp=ts,
+                                )
+                            )
+                        elif not p_obj.is_approved_for_provenance():
+                            issues.append(
+                                ProcessingIssue(
+                                    stage=stage_name,
+                                    severity=IssueSeverity.WARNING,
+                                    code=WARN_UNVERIFIED_DERATING_PARAMETERS,
+                                    message=f"Parameter '{p_name}' lacks verified test provenance (source={src}, is_verified={p_obj.is_verified}).",
+                                    field_name=p_name,
+                                    timestamp=ts,
+                                )
+                            )
         else:
             issues.append(
                 ProcessingIssue(
                     stage=stage_name,
                     severity=IssueSeverity.WARNING,
-                    code=WARN_DERATING_METHOD_UNAVAILABLE,
-                    message="Current symmetrical components unavailable for loss-based derating.",
-                    field_name="current_symmetrical",
+                    code=WARN_UNVERIFIED_DERATING_PARAMETERS,
+                    message="Loss-based negative-sequence derating parameters (R, PEC) were not provided.",
+                    field_name="derating_parameters",
                     timestamp=ts,
                 )
             )
-            return (
-                DeratingAssessmentResult(
-                    derating_factor_pu=None,
-                    method_applied=DeratingMethod.LOSS_BASED_NEGATIVE_SEQUENCE,
-                    is_derated=False,
-                    status="UNKNOWN",
-                    applicability_notes="Requires current symmetrical components.",
-                    limitations="Missing current phasors.",
-                    engineering_recommendations=recs,
+
+        # Immediate disablement of numerical recommendation (F-02)
+        issues.append(
+            ProcessingIssue(
+                stage=stage_name,
+                severity=IssueSeverity.WARNING,
+                code=WARN_DERATING_METHOD_UNAVAILABLE,
+                message=(
+                    "Loss-based negative-sequence derating is disabled by GridPulse scientific safety policy: "
+                    "no authoritative transformer standard (IEEE C57.110 applies exclusively to harmonic currents, "
+                    "not fundamental negative sequence) authorizes this formulation for static transformers. "
+                    "Numerical derating recommendation withheld."
                 ),
-                issues,
+                field_name="derating_method",
+                timestamp=ts,
             )
+        )
+        recs.append("Negative-sequence loss-based derating is unverified for static transformers; withhold numerical recommendation.")
+        return (
+            DeratingAssessmentResult(
+                derating_factor_pu=None,
+                method_applied=DeratingMethod.LOSS_BASED_NEGATIVE_SEQUENCE,
+                is_derated=False,
+                status="UNKNOWN",
+                applicability_notes="Negative-sequence loss-based derating is disabled and classified as UNVERIFIED.",
+                limitations="Standard transformer standards (IEEE C57 / IEC 60076) do not authorize negative-sequence derating curves without empirical winding test models.",
+                engineering_recommendations=recs,
+            ),
+            issues,
+        )
 
     else:
         # Unsupported or unconfigured method

@@ -13,8 +13,9 @@ Comprehensive test suite verifying Phase 2 Step 6 scientific requirements:
 import cmath
 from datetime import datetime, timedelta, timezone
 import math
-from typing import Any, Dict, List, Optional, Tuple
+from typing import Optional
 import unittest
+from unittest.mock import patch
 
 
 from scientific.contracts.asset import OperationalLimits, TransformerAssetSpec
@@ -23,11 +24,9 @@ from scientific.contracts.enums import (
     DeratingMethod,
     EvidenceClassification,
     InsulationClass,
-    IssueSeverity,
     MeasurementQuality,
-    PhaseIdentification,
+    ParameterSourceClass,
     PhaseSequence,
-    PhasorAngleConvention,
     WindingMaterial,
 )
 from scientific.contracts.issues import (
@@ -35,6 +34,9 @@ from scientific.contracts.issues import (
     ERR_INCOMPLETE_THREE_PHASE_TELEMETRY,
     ERR_MISMATCHED_PHASE_TIMESTAMPS,
     ERR_MISSING_PHASOR_ANGLES,
+    ERR_MISSING_TIMESTAMP,
+    ERR_RECONSTRUCTION_TOLERANCE_EXCEEDED,
+    ERR_UNVALIDATED_DERATING_PARAMETERS,
     WARN_CURRENT_UNBALANCE_EXCEEDS_LIMIT,
     WARN_DERATING_METHOD_UNAVAILABLE,
     WARN_UNVERIFIED_DERATING_PARAMETERS,
@@ -44,22 +46,18 @@ from scientific.contracts.issues import (
 from scientific.contracts.measurement import Measurement
 from scientific.contracts.results import (
     ElectricalFeaturesResult,
-    PhaseImbalanceResult,
     TransformerLoadingResult,
 )
 from scientific.imbalance.calculations import (
+    RECONSTRUCTION_TOLERANCE,
     calculate_phase_magnitude_imbalance,
     calculate_symmetrical_components,
     calculate_transformer_derating,
 )
 from scientific.imbalance.contracts import (
-    ComplexPhasor,
-    DeratingAssessmentResult,
     DeratingConfiguration,
+    ParameterWithProvenance,
     PhaseImbalanceInput,
-    PhaseMagnitudeImbalance,
-    PhaseQuantity,
-    SymmetricalComponentsResult,
     ThreePhaseQuantity,
 )
 from scientific.imbalance.engine import PhaseImbalanceEngine
@@ -643,10 +641,11 @@ class TestGroup6EvidenceGroundedDerating(unittest.TestCase):
             timestamp=self.ts,
         )
         self.assertIsNotNone(res)
-        self.assertEqual(res.status, "UNVERIFIED")
+        self.assertEqual(res.status, "UNKNOWN")
         self.assertIsNone(res.derating_factor_pu)
         issue_codes = [i.code for i in issues]
         self.assertIn(WARN_UNVERIFIED_DERATING_PARAMETERS, issue_codes)
+        self.assertIn(WARN_DERATING_METHOD_UNAVAILABLE, issue_codes)
 
     def test_operational_limits_exceedance_emits_warnings(self) -> None:
         """Exceeding max_voltage_unbalance_percent or max_current_unbalance_percent emits warnings."""
@@ -772,5 +771,439 @@ class TestGroup7EnginePipelineIntegration(unittest.TestCase):
         self.assertEqual(res.derating_factor_pu.unit, "pu")
 
 
+
+class TestGroup8AuditFindingsRegression(unittest.TestCase):
+    """
+    Exhaustive regression test suite verifying resolutions for audit findings F-01 through F-07:
+    - F-01: Correct calculation of maximum phase current i_max = max(Ia, Ib, Ic)
+    - F-02: Permanent disablement of unsupported LOSS_BASED_NEGATIVE_SEQUENCE derating
+    - F-03: Enforcement of ParameterWithProvenance and source suitability
+    - F-04: Phase timestamp synchronization (divergence <= 1.0 s)
+    - F-05: Reconstruction tolerance (residual <= 1e-9)
+    - F-06: Elimination of wall-clock datetime.now fallbacks
+    - F-07: Conservative evidence classification propagation
+    """
+
+    def setUp(self) -> None:
+        self.ts = datetime(2026, 10, 13, 12, 0, 0, tzinfo=timezone.utc)
+        self.spec = make_spec("TX-01")
+
+    # --- F-01: Conductor-current throughput constraint ---
+    def test_f01_depressed_phase_60_90_90(self) -> None:
+        """60 A, 90 A, 90 A: Mean 80 A, Maximum 90 A, Ratio = 80/90 = 0.888888..."""
+        tp_i = ThreePhaseQuantity.from_measurements(
+            va=make_meas(60.0, "A", ts=self.ts),
+            vb=make_meas(90.0, "A", ts=self.ts),
+            vc=make_meas(90.0, "A", ts=self.ts),
+            asset_id="TX-01",
+            timestamp=self.ts,
+        )
+        i_imb, _ = calculate_phase_magnitude_imbalance(tp_i, "CURRENT")
+        res, issues = calculate_transformer_derating(
+            current_imbalance=i_imb,
+            current_symmetrical=None,
+            voltage_imbalance=None,
+            voltage_symmetrical=None,
+            asset_spec=self.spec,
+            derating_config=DeratingConfiguration(method=DeratingMethod.MAX_PHASE_CURRENT_CAPACITY),
+            timestamp=self.ts,
+            current_three_phase=tp_i,
+        )
+        self.assertIsNotNone(res)
+        self.assertEqual(res.status, "CALCULATED")
+        self.assertTrue(res.is_derated)
+        self.assertIsNotNone(res.derating_factor_pu)
+        self.assertAlmostEqual(res.derating_factor_pu.value, 80.0 / 90.0, places=5)
+        # Verify non-universal thermal constraint metadata
+        self.assertIn("constraint_type", res.derating_factor_pu.metadata)
+        self.assertEqual(res.derating_factor_pu.metadata["constraint_type"], "CONDUCTOR_CURRENT_THROUGHPUT_LIMIT")
+        self.assertFalse(res.derating_factor_pu.metadata["is_universal_thermal_derating"])
+
+    def test_f01_single_phase_drop_0_60_60(self) -> None:
+        """0 A, 60 A, 60 A: Mean 40 A, Maximum 60 A, Ratio = 40/60 = 0.666666..."""
+        tp_i = ThreePhaseQuantity.from_measurements(
+            va=make_meas(0.0, "A", ts=self.ts),
+            vb=make_meas(60.0, "A", ts=self.ts),
+            vc=make_meas(60.0, "A", ts=self.ts),
+            asset_id="TX-01",
+            timestamp=self.ts,
+        )
+        i_imb, _ = calculate_phase_magnitude_imbalance(tp_i, "CURRENT")
+        res, issues = calculate_transformer_derating(
+            current_imbalance=i_imb,
+            current_symmetrical=None,
+            voltage_imbalance=None,
+            voltage_symmetrical=None,
+            asset_spec=self.spec,
+            derating_config=DeratingConfiguration(method=DeratingMethod.MAX_PHASE_CURRENT_CAPACITY),
+            timestamp=self.ts,
+            current_three_phase=tp_i,
+        )
+        self.assertIsNotNone(res)
+        self.assertIsNotNone(res.derating_factor_pu)
+        self.assertAlmostEqual(res.derating_factor_pu.value, 40.0 / 60.0, places=5)
+
+    def test_f01_balanced_currents(self) -> None:
+        """Balanced currents (100 A, 100 A, 100 A): Mean 100 A, Max 100 A, Derate = 1.0 pu, is_derated = False."""
+        tp_i = ThreePhaseQuantity.from_measurements(
+            va=make_meas(100.0, "A", ts=self.ts),
+            vb=make_meas(100.0, "A", ts=self.ts),
+            vc=make_meas(100.0, "A", ts=self.ts),
+            asset_id="TX-01",
+            timestamp=self.ts,
+        )
+        i_imb, _ = calculate_phase_magnitude_imbalance(tp_i, "CURRENT")
+        res, _ = calculate_transformer_derating(
+            current_imbalance=i_imb,
+            current_symmetrical=None,
+            voltage_imbalance=None,
+            voltage_symmetrical=None,
+            asset_spec=self.spec,
+            derating_config=DeratingConfiguration(method=DeratingMethod.MAX_PHASE_CURRENT_CAPACITY),
+            timestamp=self.ts,
+            current_three_phase=tp_i,
+        )
+        self.assertIsNotNone(res)
+        self.assertAlmostEqual(res.derating_factor_pu.value, 1.0, places=5)
+        self.assertFalse(res.is_derated)
+
+    def test_f01_all_zero_currents_avoids_division_by_zero(self) -> None:
+        """All-zero currents (0 A, 0 A, 0 A): Mean 0 A, Max 0 A -> returns 1.0 pu without ZeroDivisionError."""
+        tp_i = ThreePhaseQuantity.from_measurements(
+            va=make_meas(0.0, "A", ts=self.ts),
+            vb=make_meas(0.0, "A", ts=self.ts),
+            vc=make_meas(0.0, "A", ts=self.ts),
+            asset_id="TX-01",
+            timestamp=self.ts,
+        )
+        i_imb, _ = calculate_phase_magnitude_imbalance(tp_i, "CURRENT")
+        res, _ = calculate_transformer_derating(
+            current_imbalance=i_imb,
+            current_symmetrical=None,
+            voltage_imbalance=None,
+            voltage_symmetrical=None,
+            asset_spec=self.spec,
+            derating_config=DeratingConfiguration(method=DeratingMethod.MAX_PHASE_CURRENT_CAPACITY),
+            timestamp=self.ts,
+            current_three_phase=tp_i,
+        )
+        self.assertIsNotNone(res)
+        self.assertAlmostEqual(res.derating_factor_pu.value, 1.0, places=5)
+        self.assertFalse(res.is_derated)
+
+    def test_f01_missing_or_non_finite_currents_quarantined(self) -> None:
+        """Non-finite inputs are quarantined and cannot produce a derating recommendation."""
+        tp_i = ThreePhaseQuantity.from_measurements(
+            va=make_meas(float("nan"), "A", ts=self.ts),
+            vb=make_meas(100.0, "A", ts=self.ts),
+            vc=make_meas(100.0, "A", ts=self.ts),
+            asset_id="TX-01",
+            timestamp=self.ts,
+        )
+        i_imb, _ = calculate_phase_magnitude_imbalance(tp_i, "CURRENT")
+        self.assertIsNone(i_imb)
+        res, _ = calculate_transformer_derating(
+            current_imbalance=i_imb,
+            current_symmetrical=None,
+            voltage_imbalance=None,
+            voltage_symmetrical=None,
+            asset_spec=self.spec,
+            derating_config=DeratingConfiguration(method=DeratingMethod.MAX_PHASE_CURRENT_CAPACITY),
+            timestamp=self.ts,
+        )
+        self.assertIsNotNone(res)
+        self.assertEqual(res.status, "UNKNOWN")
+        self.assertIsNone(res.derating_factor_pu)
+
+    # --- F-02: Permanent disablement of unsupported negative-sequence loss-based derating ---
+    def test_f02_loss_based_derating_permanently_disabled_even_with_parameters(self) -> None:
+        """Even with fully verified parameters, LOSS_BASED_NEGATIVE_SEQUENCE returns UNKNOWN and emits warning."""
+        r_param = ParameterWithProvenance(
+            parameter_name="loss_ratio_r",
+            value=4.0,
+            unit="ratio",
+            source_class=ParameterSourceClass.FACTORY_TEST,
+            reference_document="FAT-123.pdf",
+            is_verified=True,
+            applicable_asset_id="TX-01",
+        )
+        pec_param = ParameterWithProvenance(
+            parameter_name="eddy_loss_factor_pec",
+            value=0.15,
+            unit="ratio",
+            source_class=ParameterSourceClass.FACTORY_TEST,
+            reference_document="FAT-123.pdf",
+            is_verified=True,
+            applicable_asset_id="TX-01",
+        )
+        config = DeratingConfiguration(
+            method=DeratingMethod.LOSS_BASED_NEGATIVE_SEQUENCE,
+            loss_ratio_r=r_param,
+            eddy_loss_factor_pec=pec_param,
+        )
+        res, issues = calculate_transformer_derating(
+            current_imbalance=None,
+            current_symmetrical=None,
+            voltage_imbalance=None,
+            voltage_symmetrical=None,
+            asset_spec=self.spec,
+            derating_config=config,
+            timestamp=self.ts,
+        )
+        self.assertIsNotNone(res)
+        self.assertEqual(res.status, "UNKNOWN")
+        self.assertIsNone(res.derating_factor_pu)
+        issue_codes = [i.code for i in issues]
+        self.assertIn(WARN_DERATING_METHOD_UNAVAILABLE, issue_codes)
+
+    # --- F-03: Parameter provenance and suitability ---
+    def test_f03_bare_float_parameters_rejected_by_derating_configuration(self) -> None:
+        """Passing bare float primitives to DeratingConfiguration raises TypeError."""
+        with self.assertRaises(TypeError):
+            DeratingConfiguration(
+                method=DeratingMethod.LOSS_BASED_NEGATIVE_SEQUENCE,
+                loss_ratio_r=4.0,  # Bare float!
+            )
+
+    def test_f03_unsuitable_nameplate_source_rejected_for_loss_parameters(self) -> None:
+        """Nameplate cannot legitimately establish loss ratio R or eddy loss PEC; rejected with structured issue."""
+        r_param = ParameterWithProvenance(
+            parameter_name="loss_ratio_r",
+            value=4.0,
+            unit="ratio",
+            source_class="NAMEPLATE",  # Unsuitable source for loss parameters!
+            reference_document="Nameplate Photo",
+            is_verified=True,
+            applicable_asset_id="TX-01",
+        )
+        config = DeratingConfiguration(
+            method=DeratingMethod.LOSS_BASED_NEGATIVE_SEQUENCE,
+            loss_ratio_r=r_param,
+            eddy_loss_factor_pec=None,
+        )
+        res, issues = calculate_transformer_derating(
+            current_imbalance=None,
+            current_symmetrical=None,
+            voltage_imbalance=None,
+            voltage_symmetrical=None,
+            asset_spec=self.spec,
+            derating_config=config,
+            timestamp=self.ts,
+        )
+        issue_codes = [i.code for i in issues]
+        self.assertIn(ERR_UNVALIDATED_DERATING_PARAMETERS, issue_codes)
+
+    def test_f03_unverified_provenance_rejected(self) -> None:
+        """Parameters with is_verified=False or ENGINEERING_ASSUMPTION emit WARN_UNVERIFIED_DERATING_PARAMETERS."""
+        r_param = ParameterWithProvenance(
+            parameter_name="loss_ratio_r",
+            value=4.0,
+            unit="ratio",
+            source_class=ParameterSourceClass.ENGINEERING_ASSUMPTION,
+            reference_document="Typical assumption",
+            is_verified=False,
+            applicable_asset_id="TX-01",
+        )
+        config = DeratingConfiguration(
+            method=DeratingMethod.LOSS_BASED_NEGATIVE_SEQUENCE,
+            loss_ratio_r=r_param,
+            eddy_loss_factor_pec=None,
+        )
+        res, issues = calculate_transformer_derating(
+            current_imbalance=None,
+            current_symmetrical=None,
+            voltage_imbalance=None,
+            voltage_symmetrical=None,
+            asset_spec=self.spec,
+            derating_config=config,
+            timestamp=self.ts,
+        )
+        issue_codes = [i.code for i in issues]
+        self.assertIn(WARN_UNVERIFIED_DERATING_PARAMETERS, issue_codes)
+
+    # --- F-04: Phase timestamp synchronization ---
+    def test_f04_symmetrical_timestamps_aligned_pass(self) -> None:
+        """All timestamps aligned (0.0 s difference) computes symmetrical components successfully."""
+        tp = ThreePhaseQuantity.from_phasors(
+            mag_a=make_meas(230.0, "V", ts=self.ts),
+            ang_a=make_meas(0.0, "degrees", ts=self.ts),
+            mag_b=make_meas(230.0, "V", ts=self.ts),
+            ang_b=make_meas(-120.0, "degrees", ts=self.ts),
+            mag_c=make_meas(230.0, "V", ts=self.ts),
+            ang_c=make_meas(120.0, "degrees", ts=self.ts),
+            asset_id="TX-01",
+            timestamp=self.ts,
+        )
+        res, issues = calculate_symmetrical_components(tp, "VOLTAGE")
+        self.assertIsNotNone(res)
+        self.assertEqual(len(issues), 0)
+
+    def test_f04_symmetrical_timestamps_boundary_1_second_pass(self) -> None:
+        """Timestamp divergence exactly at 1.0 s boundary passes."""
+        ts_b = self.ts + timedelta(seconds=1.0)  # Exactly 1.0 s
+        tp = ThreePhaseQuantity.from_phasors(
+            mag_a=make_meas(230.0, "V", ts=self.ts),
+            ang_a=make_meas(0.0, "degrees", ts=self.ts),
+            mag_b=make_meas(230.0, "V", ts=ts_b),
+            ang_b=make_meas(-120.0, "degrees", ts=ts_b),
+            mag_c=make_meas(230.0, "V", ts=self.ts),
+            ang_c=make_meas(120.0, "degrees", ts=self.ts),
+            asset_id="TX-01",
+            timestamp=self.ts,
+        )
+        res, issues = calculate_symmetrical_components(tp, "VOLTAGE")
+        self.assertIsNotNone(res)
+        self.assertEqual(len(issues), 0)
+
+    def test_f04_symmetrical_timestamps_diverging_rejected(self) -> None:
+        """Timestamp divergence exceeding 1.0 s (e.g. 1.05 s) is rejected with ERR_MISMATCHED_PHASE_TIMESTAMPS."""
+        ts_b = self.ts + timedelta(seconds=1.05)
+        tp = ThreePhaseQuantity.from_phasors(
+            mag_a=make_meas(230.0, "V", ts=self.ts),
+            ang_a=make_meas(0.0, "degrees", ts=self.ts),
+            mag_b=make_meas(230.0, "V", ts=ts_b),
+            ang_b=make_meas(-120.0, "degrees", ts=ts_b),
+            mag_c=make_meas(230.0, "V", ts=self.ts),
+            ang_c=make_meas(120.0, "degrees", ts=self.ts),
+            asset_id="TX-01",
+            timestamp=self.ts,
+        )
+        res, issues = calculate_symmetrical_components(tp, "VOLTAGE")
+        self.assertIsNone(res)
+        issue_codes = [i.code for i in issues]
+        self.assertIn(ERR_MISMATCHED_PHASE_TIMESTAMPS, issue_codes)
+
+    # --- F-05: Reconstruction tolerance enforcement ---
+    def test_f05_valid_reconstruction_passes_tolerance(self) -> None:
+        """Standard valid symmetrical transformation exhibits reconstruction error well below RECONSTRUCTION_TOLERANCE."""
+        tp = ThreePhaseQuantity.from_phasors(
+            mag_a=make_meas(230.0, "V", ts=self.ts),
+            ang_a=make_meas(0.0, "degrees", ts=self.ts),
+            mag_b=make_meas(220.0, "V", ts=self.ts),
+            ang_b=make_meas(-125.0, "degrees", ts=self.ts),
+            mag_c=make_meas(235.0, "V", ts=self.ts),
+            ang_c=make_meas(118.0, "degrees", ts=self.ts),
+            asset_id="TX-01",
+            timestamp=self.ts,
+        )
+        res, issues = calculate_symmetrical_components(tp, "VOLTAGE")
+        self.assertIsNotNone(res)
+        self.assertLess(res.reconstruction_max_error, RECONSTRUCTION_TOLERANCE)
+
+    def test_f05_invalid_reconstruction_residual_quarantined(self) -> None:
+        """When reconstruction residual exceeds RECONSTRUCTION_TOLERANCE, return None and emit ERR_RECONSTRUCTION_TOLERANCE_EXCEEDED."""
+        tp = ThreePhaseQuantity.from_phasors(
+            mag_a=make_meas(230.0, "V", ts=self.ts),
+            ang_a=make_meas(0.0, "degrees", ts=self.ts),
+            mag_b=make_meas(220.0, "V", ts=self.ts),
+            ang_b=make_meas(-125.0, "degrees", ts=self.ts),
+            mag_c=make_meas(235.0, "V", ts=self.ts),
+            ang_c=make_meas(118.0, "degrees", ts=self.ts),
+            asset_id="TX-01",
+            timestamp=self.ts,
+        )
+        # Mock RECONSTRUCTION_TOLERANCE to 1e-25 so standard machine precision residual triggers quarantine
+        with patch("scientific.imbalance.calculations.RECONSTRUCTION_TOLERANCE", 1e-25):
+            res, issues = calculate_symmetrical_components(tp, "VOLTAGE")
+            self.assertIsNone(res)
+            issue_codes = [i.code for i in issues]
+            self.assertIn(ERR_RECONSTRUCTION_TOLERANCE_EXCEEDED, issue_codes)
+
+    # --- F-06: Elimination of wall-clock datetime.now fallbacks ---
+    def test_f06_missing_engine_timestamp_rejected_without_wall_clock(self) -> None:
+        """If input lacks timestamps completely, engine returns is_computed=False with ERR_MISSING_TIMESTAMP."""
+        engine = PhaseImbalanceEngine(asset_spec=self.spec)
+        features = ElectricalFeaturesResult(is_computed=True)  # No timestamps in measurements
+        loading = TransformerLoadingResult(is_computed=True)
+        inp = PhaseImbalanceInput(features=features, loading=loading, asset_spec=self.spec)
+        res, issues = engine.compute_imbalance(inp)
+        self.assertFalse(res.is_computed)
+        issue_codes = [i.code for i in issues]
+        self.assertIn(ERR_MISSING_TIMESTAMP, issue_codes)
+
+    def test_f06_derating_missing_timestamp_rejected(self) -> None:
+        """calculate_transformer_derating with timestamp=None returns UNKNOWN with ERR_MISSING_TIMESTAMP."""
+        res, issues = calculate_transformer_derating(
+            current_imbalance=None,
+            current_symmetrical=None,
+            voltage_imbalance=None,
+            voltage_symmetrical=None,
+            asset_spec=self.spec,
+            timestamp=None,  # Missing!
+        )
+        self.assertIsNotNone(res)
+        self.assertEqual(res.status, "UNKNOWN")
+        issue_codes = [i.code for i in issues]
+        self.assertIn(ERR_MISSING_TIMESTAMP, issue_codes)
+
+    # --- F-07: Conservative evidence classification propagation ---
+    def test_f07_measured_evidence_yields_calculated(self) -> None:
+        """MEASURED input phase currents yield CALCULATED derating factor."""
+        tp_i = ThreePhaseQuantity.from_measurements(
+            va=make_meas(110.0, "A", evidence=EvidenceClassification.MEASURED, ts=self.ts),
+            vb=make_meas(100.0, "A", evidence=EvidenceClassification.MEASURED, ts=self.ts),
+            vc=make_meas(90.0, "A", evidence=EvidenceClassification.MEASURED, ts=self.ts),
+            asset_id="TX-01",
+            timestamp=self.ts,
+        )
+        i_imb, _ = calculate_phase_magnitude_imbalance(tp_i, "CURRENT")
+        res, _ = calculate_transformer_derating(
+            current_imbalance=i_imb,
+            current_symmetrical=None,
+            voltage_imbalance=None,
+            voltage_symmetrical=None,
+            asset_spec=self.spec,
+            timestamp=self.ts,
+            current_three_phase=tp_i,
+        )
+        self.assertIsNotNone(res.derating_factor_pu)
+        self.assertEqual(res.derating_factor_pu.evidence, EvidenceClassification.CALCULATED)
+
+    def test_f07_modeled_evidence_preserved_never_upgraded(self) -> None:
+        """MODELED input on any phase preserves MODELED on derating factor, never upgrading to CALCULATED."""
+        tp_i = ThreePhaseQuantity.from_measurements(
+            va=make_meas(110.0, "A", evidence=EvidenceClassification.MEASURED, ts=self.ts),
+            vb=make_meas(100.0, "A", evidence=EvidenceClassification.MODELED, ts=self.ts),
+            vc=make_meas(90.0, "A", evidence=EvidenceClassification.MEASURED, ts=self.ts),
+            asset_id="TX-01",
+            timestamp=self.ts,
+        )
+        i_imb, _ = calculate_phase_magnitude_imbalance(tp_i, "CURRENT")
+        res, _ = calculate_transformer_derating(
+            current_imbalance=i_imb,
+            current_symmetrical=None,
+            voltage_imbalance=None,
+            voltage_symmetrical=None,
+            asset_spec=self.spec,
+            timestamp=self.ts,
+            current_three_phase=tp_i,
+        )
+        self.assertIsNotNone(res.derating_factor_pu)
+        self.assertEqual(res.derating_factor_pu.evidence, EvidenceClassification.MODELED)
+
+    def test_f07_suspect_quality_propagates(self) -> None:
+        """SUSPECT quality on any input phase propagates to SUSPECT quality on derating factor."""
+        tp_i = ThreePhaseQuantity.from_measurements(
+            va=make_meas(110.0, "A", quality=MeasurementQuality.GOOD, ts=self.ts),
+            vb=make_meas(100.0, "A", quality=MeasurementQuality.SUSPECT, ts=self.ts),
+            vc=make_meas(90.0, "A", quality=MeasurementQuality.GOOD, ts=self.ts),
+            asset_id="TX-01",
+            timestamp=self.ts,
+        )
+        i_imb, _ = calculate_phase_magnitude_imbalance(tp_i, "CURRENT")
+        res, _ = calculate_transformer_derating(
+            current_imbalance=i_imb,
+            current_symmetrical=None,
+            voltage_imbalance=None,
+            voltage_symmetrical=None,
+            asset_spec=self.spec,
+            timestamp=self.ts,
+            current_three_phase=tp_i,
+        )
+        self.assertIsNotNone(res.derating_factor_pu)
+        self.assertEqual(res.derating_factor_pu.quality, MeasurementQuality.SUSPECT)
+
+
 if __name__ == "__main__":
     unittest.main()
+
